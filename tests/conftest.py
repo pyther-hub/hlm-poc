@@ -42,3 +42,18 @@ def tiny_model_dir(tmp_path_factory):
     Qwen3Model(config).save_pretrained(path)
     tokenizer.save_pretrained(path)
     return path
+
+
+def build_teacher_index(emb_dir, data, model_dir, dim, sets):
+    """What the teacher notebook writes, without DDP: each set encoded in-process as one shard, merged by
+    teacher.merge_shards (so the on-disk layout is the real one)."""
+    from model import encode, load_encoder
+    from teacher import QUERY_PROMPT, merge_shards, shard_path
+    device = torch.device("cpu")
+    model, tok = load_encoder(model_dir, device)
+    os.makedirs(emb_dir, exist_ok=True)
+    for name in sets:
+        prefix = "" if name == "corpus" else QUERY_PROMPT
+        emb = encode(model, tok, data[name]["texts"], device, dim, 32, prefix)
+        np.save(shard_path(emb_dir, name, 0, 1), emb.numpy())
+        merge_shards(emb_dir, name, 1, data[name]["ids"])

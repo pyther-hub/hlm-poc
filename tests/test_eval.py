@@ -1,5 +1,5 @@
 """Evaluation: retrieval, metrics by hand, sanity checks, and the notebook flow on a tiny cached index.
-The index is built in-process with encode (no DDP) as one shard each, merged by teacher.merge_shards."""
+The index is built in-process by conftest.build_teacher_index (no DDP)."""
 import math
 import os
 
@@ -7,12 +7,12 @@ import numpy as np
 import pytest
 import torch
 
-from conftest import tiny_rows
+from conftest import build_teacher_index, tiny_rows
 from data import build_data
 from evaluation import (check_emb, compute_metrics, evaluate_model, load_index, measure_latency, retrieve_topk,
                         save_metrics, summarize, teacher_ceiling, truncate)
-from model import encode, load_encoder
-from teacher import QUERY_PROMPT, merge_shards, shard_path
+from model import load_encoder
+from teacher import QUERY_PROMPT
 
 DEVICE = torch.device("cpu")
 DIM = 32
@@ -23,13 +23,7 @@ def index(tmp_path_factory, tiny_model_dir):
     root = str(tmp_path_factory.mktemp("eval"))
     data = build_data(tiny_rows(60), core_n=40, n_val=6, n_test=6, n_align=50, split_seed=1)
     emb_dir = os.path.join(root, "emb")
-    model, tok = load_encoder(tiny_model_dir, DEVICE)
-    for name in ("corpus", "val", "test"):
-        prefix = "" if name == "corpus" else QUERY_PROMPT
-        emb = encode(model, tok, data[name]["texts"], DEVICE, DIM, 32, prefix)
-        os.makedirs(emb_dir, exist_ok=True)
-        np.save(shard_path(emb_dir, name, 0, 1), emb.numpy())
-        merge_shards(emb_dir, name, 1, data[name]["ids"])
+    build_teacher_index(emb_dir, data, tiny_model_dir, DIM, ("corpus", "val", "test"))
     return root, data, emb_dir
 
 

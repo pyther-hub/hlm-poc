@@ -1,7 +1,12 @@
+import functools
+import json
+import math
 import os
+import shutil
 import time
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 
@@ -22,10 +27,12 @@ def load_tokenizer(name):
 
 
 def load_encoder(name, device, dtype=torch.float32, device_map=None):
-    """name: hub id or local dir. Frozen, eval mode.
-    device_map (e.g. "auto") spreads a model too big for one GPU; device is then ignored."""
+    """name: hub id, local model dir, or adapter dir (written by save_adapter: base + adapter are rebuilt).
+    Frozen, eval mode. device_map (e.g. "auto") spreads a model too big for one GPU; device is then ignored."""
     if name.startswith(("/", ".", "~")) and not os.path.isdir(os.path.expanduser(name)):
         raise FileNotFoundError(f"model dir not found: {name}")
+    if os.path.isfile(os.path.join(os.path.expanduser(name), ADAPTER_CONFIG)):
+        return load_adapter(name, device, dtype)
     tokenizer = load_tokenizer(name)
     model = AutoModel.from_pretrained(name, dtype=dtype, attn_implementation="sdpa", device_map=device_map)
     if device_map is None:
@@ -65,7 +72,8 @@ def embed(model, input_ids, attention_mask, dim):
 def encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False):
     """Unit-norm [N, dim] fp16 CPU tensor in input order. Batches are length-sorted so little compute goes to padding.
     progress=True prints a line every ~5% of batches (rank 0 only), labelled with the device. Plain prints, not tqdm:
-    a tqdm bar drawn in a spawned worker doesn't show up in the notebook. Longest texts go first, so the early ETA is pessimistic."""
+    a tqdm bar drawn in a spawned worker doesn't show up in the notebook. Longest texts go first, so the early ETA is
+    pessimistic."""
     model.eval()
     #sort in order of token lens for effective gpu batching, then restore original order at the end
     order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
@@ -86,3 +94,83 @@ def encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_si
             print(f"[encode {device}] {b + 1}/{n_batches} batches  {elapsed / 60:.1f} min  eta {eta / 60:.1f} min",
                   flush=True)
     return out
+
+
+# ---------- adapter: LoRA on the decoder's linears + a linear head after the final norm ----------
+# Plain parameters registered on the frozen modules + forward hooks; no wrapper classes. Checkpoints hold only the
+# adapter: adapter.pt (LoRA + head weights) and adapter_config.json (base model + shapes).
+
+ADAPTER_WEIGHTS, ADAPTER_CONFIG, TRAINER_STATE = "adapter.pt", "adapter_config.json", "trainer_state.pt"
+
+
+def _lora_hook(scale, dropout, module, args, out):
+    x = F.dropout(args[0], dropout, module.training)
+    return out + (x @ module.lora_A.T @ module.lora_B.T) * scale
+
+
+def _head_hook(head, module, args, out):
+    return head(out)
+
+
+def attach_adapter(model, rank, alpha, dropout, targets, out_dim):
+    """LoRA (A random, B zero, scale alpha/rank) on every nn.Linear whose name ends in one of `targets`, and a
+    Linear(hidden -> out_dim) on the final norm's output, so model(...).last_hidden_state is out_dim wide.
+    At init the backbone is unchanged. Adapter params are created trainable, in the base weights' dtype/device."""
+    n = 0
+    for name, m in model.named_modules():
+        if isinstance(m, nn.Linear) and name.rsplit(".", 1)[-1] in targets:
+            w = m.weight
+            m.lora_A = nn.Parameter(torch.empty(rank, m.in_features, dtype=w.dtype, device=w.device))
+            nn.init.kaiming_uniform_(m.lora_A, a=math.sqrt(5))
+            m.lora_B = nn.Parameter(torch.zeros(m.out_features, rank, dtype=w.dtype, device=w.device))
+            m.register_forward_hook(functools.partial(_lora_hook, alpha / rank, dropout))
+            n += 1
+    assert n, f"no nn.Linear matches lora targets {targets}"
+    w = model.norm.weight
+    model.align_head = nn.Linear(model.config.hidden_size, out_dim, dtype=w.dtype, device=w.device)
+    model.norm.register_forward_hook(functools.partial(_head_hook, model.align_head))
+    return model
+
+
+def is_adapter_key(key):
+    return ".lora_" in key or key.startswith("align_head.")
+
+
+def adapter_params(model):
+    """(lora params, head params), trainable."""
+    named = [(k, p) for k, p in model.named_parameters() if is_adapter_key(k)]
+    return [p for k, p in named if ".lora_" in k], [p for k, p in named if k.startswith("align_head.")]
+
+
+def save_adapter(model, path, adapter_cfg, trainer_state=None):
+    """Adapter weights + config (+ optional trainer_state for resuming) into dir `path`, written to path.tmp and
+    swapped in, so a crash never leaves a half-written checkpoint."""
+    tmp = path + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items() if is_adapter_key(k)},
+               os.path.join(tmp, ADAPTER_WEIGHTS))
+    with open(os.path.join(tmp, ADAPTER_CONFIG), "w") as f:
+        json.dump(adapter_cfg, f, indent=1)
+    if trainer_state is not None:
+        torch.save(trainer_state, os.path.join(tmp, TRAINER_STATE))
+    shutil.rmtree(path, ignore_errors=True)
+    os.replace(tmp, path)
+
+
+def load_adapter_weights(model, path):
+    missing, unexpected = model.load_state_dict(
+        torch.load(os.path.join(path, ADAPTER_WEIGHTS), map_location=next(model.parameters()).device), strict=False)
+    missing = [k for k in missing if is_adapter_key(k)]
+    assert not missing and not unexpected, f"adapter mismatch: missing {missing}, unexpected {unexpected}"
+
+
+def load_adapter(path, device, dtype=torch.float32):
+    """Base model from adapter_config.json + the saved adapter. Frozen, eval mode."""
+    with open(os.path.join(path, ADAPTER_CONFIG)) as f:
+        cfg = json.load(f)
+    model, tokenizer = load_encoder(cfg["base"], device, dtype)
+    attach_adapter(model, cfg["rank"], cfg["alpha"], cfg["dropout"], cfg["targets"], cfg["out_dim"])
+    load_adapter_weights(model, path)
+    model.requires_grad_(False)
+    return model.eval(), tokenizer

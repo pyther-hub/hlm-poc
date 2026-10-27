@@ -1,11 +1,12 @@
 # hlm-poc: aligning a small query encoder to a frozen teacher document index
 
-A frozen **teacher** (Qwen3-Embedding-4B) embeds the document corpus once. Later, a small **student** query
-encoder (Qwen3-Embedding-0.6B) will be trained to retrieve against that frozen index, so documents never need
-re-embedding when the query side changes.
+A frozen **teacher** (Qwen3-Embedding-4B) embeds the document corpus once. A small **student** query encoder
+(Qwen3-Embedding-0.6B) is trained to retrieve against that frozen index, so documents never need re-embedding when
+the query side changes.
 
-**Current scope: phase 1 only.** Build the MS MARCO data, embed it with the teacher on 2 GPUs, and evaluate
-retrieval on val/test against that index. No fine-tuning yet. Experiments run on Kaggle (GPU T4 x2). This repo holds
+**Current scope.** Phase 1: build the MS MARCO data, embed it with the teacher on 2 GPUs, and evaluate retrieval on
+val/test against that index. Phase 2: alignment fine-tuning of the student (LoRA r=16 + linear head, DDP) onto the
+teacher's query vectors. Experiments run on Kaggle (GPU T4 x2). This repo holds
 the flat, tested functions the notebooks import: plain functions, no classes, no global state, no config system.
 
 ---
@@ -15,15 +16,15 @@ the flat, tested functions the notebooks import: plain functions, no classes, no
 ### 0.1 Modules
 ```
        notebooks/phase_1_teacher.ipynb (4 steps)        notebooks/phase_1_eval.ipynb (5 steps)
-              │                 │                                  │
-       ┌──────▼───┐       ┌─────▼──────┐                  ┌────────▼───────┐
-       │ data.py  │       │ teacher.py │  embed_main,     │ evaluation.py  │  load_index (checks), teacher_ceiling,
-       │ rows,    │       │            │  merge_shards,   │                │  evaluate_model, METRICS, summarize,
-       │ splits,  │       └─────┬──────┘  fp16_sanity,    └────────┬───────┘  measure_latency
-       │ corpus   │             │         time_embedding           │
-       └────┬─────┘       ┌─────▼──────────────────────────────────▼─┐
-            └────────────▶│ model.py  load_encoder · tokenize · encode│
-                          └─────┬────────────────────────────────────┘
+              │                 │                                  │     notebooks/phase_2_align.ipynb (4 steps)
+       ┌──────▼───┐       ┌─────▼──────┐                  ┌────────▼───────┐       ┌──────▼─────┐
+       │ data.py  │       │ teacher.py │  embed_main,     │ evaluation.py  │◀──────│  align.py  │ align_main,
+       │ rows,    │       │            │  merge_shards,   │                │       │            │ LOSSES
+       │ splits,  │       └─────┬──────┘  fp16_sanity,    └────────┬───────┘       └──────┬─────┘
+       │ corpus   │             │         time_embedding           │                      │
+       └────┬─────┘       ┌─────▼──────────────────────────────────▼──────────────────────▼─┐
+            └────────────▶│ model.py  load_encoder · tokenize · encode · attach/save_adapter │
+                          └─────┬───────────────────────────────────────────────────────────┘
                           ┌─────▼─────┐
                           │  ddp.py   │  launch/setup/barrier/is_main (no-ops without a process group)
                           └───────────┘
@@ -43,7 +44,17 @@ embed_main (2 GPUs, shard per rank) ─▶ emb/teacher/{corpus,align,val,test}.n
    ▼
 phase_1_eval (1 GPU): queries (cached teacher vectors, or any model) → top-100 over the teacher corpus
    ─▶ runs/<mode>/eval/metrics.json   {row name: {split: metrics}}
+   ▼
+align_main (2 GPUs, DDP): student(align query) ≈ teacher align.npy, adapter only
+   ─▶ runs/<mode>/align/{step_<n>, final}/ adapter.pt + adapter_config.json, log.jsonl
 ```
+
+Adapter (`model.attach_adapter`, plain parameters + forward hooks, no wrapper classes):
+```
+input ─▶ decoder layers (frozen; every q,k,v,o,gate,up,down Linear: W x + B A x · alpha/r) ─▶ final norm
+      ─▶ align_head Linear(1024 → 256) ─▶ last-token pool ─▶ L2 normalise      (B = 0 at init)
+```
+`model(...).last_hidden_state` is already 256 wide, so `embed` / `encode` / `evaluate_model` work unchanged.
 
 DDP pattern:
 ```
@@ -104,6 +115,20 @@ Then open `notebooks/phase_1_eval.ipynb` with the same `DEBUG` value. It reads t
 | 4 · Summary | One table per split, teacher first, retention = nDCG@10 / teacher nDCG@10. |
 | 5 · Latency | ms/query and queries/s per batch size, teacher (with its prompt) vs student. |
 
+Phase 2: open `notebooks/phase_2_align.ipynb` with the same `DEBUG` value (GPU T4 x2).
+
+| Cell | What it does |
+|---|---|
+| Control panel | `DEBUG`, `NPROCS`, paths, `ALIGN` (all of `ALIGN_DEFAULTS`, §4.4; `dim` read from `TEACHER_DEFAULTS`). |
+| 1 · Check inputs | `check_emb` on the teacher's `align`, `val`, `corpus` vectors; the loss name exists; planned steps. |
+| 2 · Train | `launch(align_main, ALIGN, nprocs=NPROCS)`. Resumes from the latest `step_<n>/`; no-op once `final/` exists. |
+| 3 · Training log | Train loss and the in-training val rows (val loss, val cos, nDCG@10, Recall@10) from `log.jsonl`. |
+| 4 · Evaluate | `evaluate_model(OUT_DIR/final, ...)` on val/test → row `aligned_r<rank>_<loss>` in `runs/<mode>/eval/metrics.json`, then `summarize`. |
+
+**Loss functions** live in `align.LOSSES` (name → `fn(student, teacher, **loss_kwargs)`, both `[B, dim]` unit
+vectors) and are picked in the control panel with `loss` / `loss_kwargs`. They can't be defined in a notebook cell:
+the DDP workers are spawned processes and only receive importable functions.
+
 **Corpus caveat:** the index is only the positives + one stored negative of the core queries (~200k passages), not
 full MS MARCO (8.8M), so absolute scores are higher than published ones. Use them to compare models.
 
@@ -121,7 +146,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 ### `model.py`
 | Function | What it does |
 |---|---|
-| `load_encoder(name, device, dtype=fp32, device_map=None)` | `name` = hub id or local dir. Returns a frozen, eval-mode `(model, tokenizer)`. `AutoModel` with sdpa. A missing local dir raises `FileNotFoundError`. `device_map="auto"` spreads a model over GPUs. |
+| `load_encoder(name, device, dtype=fp32, device_map=None)` | `name` = hub id, local dir, or adapter dir (→ `load_adapter`). Returns a frozen, eval-mode `(model, tokenizer)`. `AutoModel` with sdpa. A missing local dir raises `FileNotFoundError`. `device_map="auto"` spreads a model over GPUs. |
 | `tokenize(tokenizer, texts, max_length, prefix="")` | Left-padded batch ending in end-of-text (appended if the tokenizer doesn't). |
 | `pool_last_token(hidden, mask)` / `truncate_normalize(x, dim)` / `embed(model, ids, mask, dim)` | Last-token pooling (any padding side) / MRL truncate + L2 / both after a forward. |
 | `encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False)` | No-grad, length-sorted batches; fp16 CPU tensor `[N, dim]` in input order. `progress=True`: a `[encode cuda:0] b/n batches  elapsed  eta` line every ~5% (rank 0 only, labelled with the device), plain prints so they show from spawned workers. |
@@ -158,6 +183,21 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `save_metrics(out_dir, rows)` / `summarize(out_dir, split, retention_metric="ndcg@10")` | Merge rows into `metrics.json` / print one table, teacher first, with retention. |
 | `measure_latency(model, tokenizer, texts, device, dim, max_len, prefix, batch_sizes, repeats=3)` | Median ms/query and queries/s per batch size, with `cuda.synchronize`. |
 
+### `model.py`: adapter
+| Function | What it does |
+|---|---|
+| `attach_adapter(model, rank, alpha, dropout, targets, out_dim)` | LoRA (A Kaiming, B zero) on every `nn.Linear` named in `targets` + `align_head` Linear(hidden → out_dim) after the final norm. Hooks, no wrapper modules. |
+| `adapter_params(model)` | `(lora params, head params)`. |
+| `save_adapter(model, path, adapter_cfg, trainer_state=None)` | Dir with `adapter.pt` (adapter weights only), `adapter_config.json` (`base, rank, alpha, dropout, targets, out_dim`), optional `trainer_state.pt`. Written to `path.tmp`, then swapped in. |
+| `load_adapter(path, device, dtype)` / `load_encoder(path, ...)` | Base from the config + adapter weights; frozen, eval. `load_encoder` dispatches to it when `path` holds `adapter_config.json`. |
+
+### `align.py`
+| Function | What it does |
+|---|---|
+| `align_main(rank, world_size, cfg)` | Worker for `launch(align_main, ALIGN)`. Frozen fp32 base + adapter, DDP over adapter params, AdamW (separate LoRA / head lr), linear warmup + cosine, fp16 autocast + GradScaler on CUDA, grad clip. Each epoch one seeded permutation; rank r takes its slice of every global batch, ragged tail dropped. Logs / evals / saves on rank 0. |
+| `LOSSES`, `l2_loss(student, teacher)` | Loss registry; `l2` = squared L2 between unit vectors (= 2 − 2 cos). |
+| `step_checkpoints(out_dir)`, `read_log(out_dir)` | Finished `step_<n>` dirs, oldest first / rows of `log.jsonl`. |
+
 ### `ddp.py`
 `launch(fn, *args, nprocs)`, `setup`, `cleanup`, `barrier`, `is_main`, `get_rank`, `get_world_size`,
 `reduce_mean`, `wrap_ddp`, `unwrap`. Copied from tiny-reasoner; all are no-ops without a process group.
@@ -184,6 +224,21 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 ### 4.3 `CHECKS` (control panel)
 `sanity_n=1000` passages for the fp16 check, `timing_n=2000` passages timed, `budget_h=5.0` (reported only).
 
+### 4.4 `ALIGN` (`align.ALIGN_DEFAULTS`)
+| Key | Default | Meaning |
+|---|---|---|
+| `model` | `"Qwen/Qwen3-Embedding-0.6B"` | Student base, frozen, loaded fp32. |
+| `dim` | `256` | Head output = teacher index dim. |
+| `lora_rank`, `lora_alpha`, `lora_dropout` | `16`, `32`, `0.05` | LoRA scale = alpha / rank. |
+| `lora_targets` | `q,k,v,o,gate,up,down _proj` | Every linear in the decoder. |
+| `query_prefix`, `max_query_len` | `""`, `32` | Student queries. |
+| `loss`, `loss_kwargs` | `"l2"`, `{}` | Name in `align.LOSSES` + its kwargs. |
+| `lr`, `head_lr`, `weight_decay`, `warmup_ratio` | `2e-4`, `1e-3`, `0.0`, `0.05` | AdamW; warmup then cosine to 0. |
+| `epochs`, `batch_size`, `grad_clip` | `1`, `128`, `1.0` | `batch_size` per GPU. |
+| `amp`, `seed` | `True`, `0` | fp16 autocast + GradScaler on CUDA; data order and adapter init. |
+| `log_every`, `eval_every`, `save_every`, `keep_last` | `20`, `200`, `500`, `2` | Steps. Debug: `5 / 20 / 20`. |
+| `data_path`, `teacher_emb_dir`, `out_dir` | `cache/data.json`, `cache/emb/teacher`, `runs/align` | The notebook sets them under `{debug,full}`. |
+
 ---
 
 ## 5. Tests (`tests/`, CPU, offline, < 30 s)
@@ -199,9 +254,13 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_check_emb_rejects_bad_inputs` | Sanity checks that don't catch bad norms or misaligned ids. |
 | `test_eval_flow` | The eval notebook's flow on a tiny index; the teacher model through `evaluate_model` reproduces the cached ceiling. |
 | `test_measure_latency_runs` | Latency helper. |
+| `test_adapter_starts_as_base_plus_head`, `test_adapter_checkpoint_roundtrip` | LoRA changing the model at init; checkpoints holding base weights or not reloading to the same vectors. |
+| `test_l2_loss_is_two_minus_two_cos` | Loss scale. |
+| `test_align_trains_and_keeps_last_checkpoints`, `test_align_resumes_from_latest_checkpoint` | 2-process alignment: loss goes down, `keep_last`, final adapter evaluates; a re-run resumes mid-run instead of restarting. |
 | `test_expected_notebooks`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
 
 ## 6. Workflow
 1. Edit locally → `.venv/bin/python -m pytest -q` → commit → push.
 2. On Kaggle: re-run the setup cell, run with `DEBUG = True`, then `DEBUG = False`.
 3. After the teacher index exists: run `phase_1_eval` with the same `DEBUG` value.
+4. Then `phase_2_align` (same `DEBUG`); its final adapter is scored into the same `metrics.json`.
