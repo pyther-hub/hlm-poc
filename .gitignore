@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.DS_Store
+runs/
+cache/
+*.pt
+*.bin
+*.safetensors
+*.npy
+*.parquet
