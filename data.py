@@ -1,15 +1,10 @@
-"""MS MARCO (Tevatron/msmarco-passage, train split) → by-query splits, corpus, alignment queries, CR triples.
+"""MS MARCO (Tevatron/msmarco-passage, train split) → by-query splits, corpus, alignment queries.
 Passages are referred to everywhere by their row in the corpus table (data["corpus"]["ids"][i]).
 Also holds the small I/O helpers for the cached artifacts (data.json, embedding .npy files, cfg merging)."""
 import json
 import os
-from functools import partial
 
 import numpy as np
-import torch
-from torch.utils.data import DataLoader, DistributedSampler
-
-from model import tokenize
 
 DATASET = "Tevatron/msmarco-passage"
 
@@ -50,21 +45,6 @@ def load_rows(n_rows, cache_dir):
         pq.write_table(pa.Table.from_pylist(rows), path + ".tmp")
         os.replace(path + ".tmp", path)
     return pq.read_table(path).to_pylist()
-
-
-def tiny_rows(n=60, n_docs=90, seed=0):
-    """Fake rows in the raw Tevatron format (then cleaned), with shared and multiple positives."""
-    rng = np.random.default_rng(seed)
-    words = "river city music cell gold tax moon salt king rain bank code lake film bird wave".split()
-
-    def doc(i):
-        return {"docid": f"d{i}", "title": "-", "text": " ".join(rng.choice(words, 12))}
-    raw = []
-    for q in range(n):
-        pos = [doc(int(rng.integers(n_docs))) for _ in range(1 + (q % 3 == 0))]
-        raw.append({"query_id": f"q{q}", "query": " ".join(rng.choice(words, 4)) + f" {q}",
-                    "positive_passages": pos, "negative_passages": [doc(int(rng.integers(n_docs))) for _ in range(3)]})
-    return clean_rows(raw)
 
 
 # ---------- splits, corpus, query sets ----------
@@ -126,32 +106,6 @@ def build_data(rows, core_n, n_val, n_test, n_align, split_seed, use_title=False
     return data
 
 
-def cr_triples(data):
-    """(query text, positive corpus row, hard-negative corpus row) for every train query."""
-    return [(t, pos[0], neg) for t, pos, neg in zip(data["train"]["texts"], data["train"]["pos"], data["train"]["neg"])]
-
-
-# ---------- loaders ----------
-
-def collate_queries(batch, tokenizer, max_len):
-    """batch: list of dicts with "text" and optionally "target" (teacher vector), "pos", "neg" (corpus rows)."""
-    enc = tokenize(tokenizer, [b["text"] for b in batch], max_len)
-    out = {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}
-    if "target" in batch[0]:
-        out["target"] = torch.from_numpy(np.stack([b["target"] for b in batch])).float()
-    for key in ("pos", "neg"):
-        if key in batch[0]:
-            out[key] = torch.tensor([b[key] for b in batch], dtype=torch.long)
-    return out
-
-
-def make_loader(items, tokenizer, batch_size, max_len, shuffle=True, distributed=False, seed=0, drop_last=False):
-    """distributed=True adds a DistributedSampler (train_loop calls set_epoch)."""
-    sampler = DistributedSampler(items, shuffle=shuffle, seed=seed, drop_last=drop_last) if distributed else None
-    return DataLoader(items, batch_size=batch_size, shuffle=shuffle and not distributed, sampler=sampler,
-                      drop_last=drop_last, collate_fn=partial(collate_queries, tokenizer=tokenizer, max_len=max_len))
-
-
 # ---------- cached artifacts ----------
 
 def save_json(obj, path):
@@ -173,7 +127,7 @@ def load_emb(emb_dir, name):
 
 def resolve_cfg(defaults, cfg):
     """defaults <- cfg. Unknown keys are an error (catches typos). Dict values (loss_kwargs) are replaced
-    whole, not merged, so switching the loss never carries over another loss's kwargs."""
+    whole, not merged."""
     unknown = set(cfg) - set(defaults)
     if unknown:
         raise KeyError(f"unknown cfg keys: {sorted(unknown)}")

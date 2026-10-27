@@ -2,11 +2,10 @@ import os
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer, Qwen3Config, Qwen3Model
+from transformers import AutoModel, AutoTokenizer
 
-from ddp import is_main, unwrap
+from ddp import is_main
 
-TINY_TOKENIZER = "openai-community/gpt2"  # small and cached; tests + local smoke runs
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
 
@@ -21,59 +20,17 @@ def load_tokenizer(name):
     return tokenizer
 
 
-def tiny_model(vocab_size, seed=0):
-    """2-layer, hidden-64 random Qwen3 encoder for tests. No download."""
-    config = Qwen3Config(vocab_size=vocab_size, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-                         num_attention_heads=4, num_key_value_heads=2, head_dim=16, max_position_embeddings=512)
-    with torch.random.fork_rng():
-        torch.manual_seed(seed)
-        return Qwen3Model(config)
-
-
-def set_trainable(model, which):
-    """which: "all" | "all_but_embeddings" | "none"."""
-    for p in model.parameters():
-        p.requires_grad = which != "none"
-    if which == "all_but_embeddings":
-        model.get_input_embeddings().weight.requires_grad = False
-
-
-def param_counts(model):
-    params = list(unwrap(model).parameters())
-    return sum(p.numel() for p in params if p.requires_grad), sum(p.numel() for p in params)
-
-
-def load_encoder(name, device, dtype=torch.float32, trainable="none", device_map=None):
-    """name: hub id, local checkpoint dir, or "tiny:<seed>" (random test model).
+def load_encoder(name, device, dtype=torch.float32, device_map=None):
+    """name: hub id or local dir. Frozen, eval mode.
     device_map (e.g. "auto") spreads a model too big for one GPU; device is then ignored."""
-    if name.startswith("tiny:"):
-        tokenizer = load_tokenizer(TINY_TOKENIZER)
-        model = tiny_model(len(tokenizer), seed=int(name[5:]))
-    else:
-        if name.startswith(("/", ".", "~")) and not os.path.isdir(os.path.expanduser(name)):
-            raise FileNotFoundError(f"checkpoint dir not found: {name}")
-        tokenizer = load_tokenizer(name)
-        model = AutoModel.from_pretrained(name, dtype=dtype, attn_implementation="sdpa", device_map=device_map)
+    if name.startswith(("/", ".", "~")) and not os.path.isdir(os.path.expanduser(name)):
+        raise FileNotFoundError(f"model dir not found: {name}")
+    tokenizer = load_tokenizer(name)
+    model = AutoModel.from_pretrained(name, dtype=dtype, attn_implementation="sdpa", device_map=device_map)
     if device_map is None:
         model = model.to(device=device, dtype=dtype)
-    set_trainable(model, trainable)
-    return model, tokenizer
-
-
-def load_encoder_dir(path, device, dtype=torch.float32, trainable="none"):
-    """Load a checkpoint written by save_encoder. Fails fast with a clear error if it's missing."""
-    if not os.path.isdir(path):
-        raise FileNotFoundError(f"checkpoint dir not found: {path} (did the stage that writes it run?)")
-    return load_encoder(path, device, dtype, trainable)
-
-
-def save_encoder(model, tokenizer, out_dir, dtype="fp16"):
-    """Weights (cast to dtype) + tokenizer. Plain save_pretrained dir, so any later stage can reload it."""
-    model = unwrap(model)
-    os.makedirs(out_dir, exist_ok=True)
-    state = {k: v.detach().to(DTYPES[dtype]) for k, v in model.state_dict().items()}
-    model.save_pretrained(out_dir, state_dict=state)
-    tokenizer.save_pretrained(out_dir)
+    model.requires_grad_(False)
+    return model.eval(), tokenizer
 
 
 def tokenize(tokenizer, texts, max_length, prefix=""):

@@ -13,7 +13,7 @@ from model import DTYPES, encode, load_encoder
 QUERY_PROMPT = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
 
 TEACHER_DEFAULTS = dict(
-    model="Qwen/Qwen3-Embedding-4B",   # hub id or "tiny:<seed>"
+    model="Qwen/Qwen3-Embedding-4B",   # hub id or local dir
     dim=256,                           # MRL truncation, then L2-normalise
     dtype="fp16",
     query_prompt=QUERY_PROMPT,         # queries only; passages get no prefix
@@ -103,7 +103,7 @@ def fp16_sanity(model_name, texts, dim, max_len, device, device_map_fp32=None):
         dev = next(model.parameters()).device
         out[dtype] = encode(model, tokenizer, texts, dev, dim, max_len, amp=False).float()
         del model
-        _empty_cache()
+        free_gpu_memory()
     cos = (out["fp32"] * out["fp16"]).sum(-1)
     result = {"mean_cos": cos.mean().item(), "min_cos": cos.min().item(),
               "nan_rows": int((~torch.isfinite(out["fp16"])).any(-1).sum())}
@@ -111,9 +111,9 @@ def fp16_sanity(model_name, texts, dim, max_len, device, device_map_fp32=None):
     return result
 
 
-def time_embedding(cfg, data, device, world_size, n_sample=2000, budget_h=3.0):
-    """Measure teacher tokens/s on a passage sample, project the full embedding run (all sets, world_size GPUs).
-    go=False means over budget: rebuild data with halve_sizes() before the full run."""
+def time_embedding(cfg, data, device, world_size, n_sample=2000, budget_h=5.0):
+    """Measure teacher tokens/s on a passage sample and project the full embedding run (all sets, world_size GPUs).
+    Only reports; over budget means you shrink DATA yourself."""
     cfg = resolve_cfg(TEACHER_DEFAULTS, cfg)
     model, tokenizer = load_encoder(cfg["model"], device, DTYPES[cfg["dtype"]])
     sample = data["corpus"]["texts"][:n_sample]
@@ -126,18 +126,11 @@ def time_embedding(cfg, data, device, world_size, n_sample=2000, budget_h=3.0):
     total = sum(_count_tokens(tokenizer, data[s]["texts"], *_set_args(cfg, s)) for s in cfg["sets"])
     projected_h = total / tokens_per_s / world_size / 3600
     del model
-    _empty_cache()
-    result = {"tokens_per_s": tokens_per_s, "total_tokens": total, "projected_h": projected_h,
-              "budget_h": budget_h, "go": projected_h <= budget_h}
+    free_gpu_memory()
+    result = {"tokens_per_s": tokens_per_s, "total_tokens": total, "projected_h": projected_h, "budget_h": budget_h}
     print(f"[time_embedding] {tokens_per_s:,.0f} tok/s per GPU, {total:,} tokens -> {projected_h:.2f} h "
-          f"on {world_size} GPU(s): {'GO' if result['go'] else 'NO-GO (halve corpus + alignment queries)'}")
+          f"on {world_size} GPU(s) (budget {budget_h} h{', OVER' if projected_h > budget_h else ''})")
     return result
-
-
-def halve_sizes(data_cfg):
-    """Halve the train part of the core set (→ corpus) and the alignment queries; val/test stay the same."""
-    held = data_cfg["n_val"] + data_cfg["n_test"]
-    return {**data_cfg, "core_n": held + (data_cfg["core_n"] - held) // 2, "n_align": data_cfg["n_align"] // 2}
 
 
 def _count_tokens(tokenizer, texts, prefix, max_len):
@@ -150,7 +143,7 @@ def _sync(device):
         torch.cuda.synchronize()
 
 
-def _empty_cache():
+def free_gpu_memory():
     import gc
     gc.collect()
     if torch.cuda.is_available():
