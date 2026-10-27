@@ -64,8 +64,8 @@ def embed(model, input_ids, attention_mask, dim):
 @torch.no_grad()
 def encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False):
     """Unit-norm [N, dim] fp16 CPU tensor in input order. Batches are length-sorted so little compute goes to padding.
-    progress=True prints a line every ~5% of batches (rank 0 only). Plain prints, not tqdm: a tqdm bar drawn in a
-    spawned worker doesn't show up in the notebook. Longest texts go first, so the early ETA is pessimistic."""
+    progress=True prints a line every ~5% of batches (rank 0 only), labelled with the device. Plain prints, not tqdm:
+    a tqdm bar drawn in a spawned worker doesn't show up in the notebook. Longest texts go first, so the early ETA is pessimistic."""
     model.eval()
     #sort in order of token lens for effective gpu batching, then restore original order at the end
     order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
@@ -83,5 +83,6 @@ def encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_si
         if progress and is_main() and ((b + 1) % log_every == 0 or b + 1 == n_batches):
             elapsed = time.perf_counter() - t0
             eta = elapsed / (b + 1) * (n_batches - b - 1)
-            print(f"[encode] {b + 1}/{n_batches} batches  {elapsed / 60:.1f} min  eta {eta / 60:.1f} min", flush=True)
+            print(f"[encode {device}] {b + 1}/{n_batches} batches  {elapsed / 60:.1f} min  eta {eta / 60:.1f} min",
+                  flush=True)
     return out

@@ -52,8 +52,8 @@ def test_truncate_normalize_unit_norm():
 def test_encode_progress_prints_lines(encoder, capsys):
     model, tok = encoder
     encode(model, tok, [f"text {i}" for i in range(10)], DEVICE, DIM, 16, batch_size=2, progress=True)
-    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("[encode]")]
-    assert len(lines) == 5 and lines[-1].startswith("[encode] 5/5 batches")
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("[encode cpu]")]
+    assert len(lines) == 5 and lines[-1].startswith("[encode cpu] 5/5 batches")
 
 
 def test_encoder_is_frozen(encoder):
