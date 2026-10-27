@@ -83,9 +83,10 @@ def teacher_ceiling(data_path, emb_dir, out_dir, splits=("val", "test"), k=100, 
 
 
 def evaluate_dir(path, data_path, emb_dir, dim, max_query_len, device, out_dir=None, name=None,
-                 splits=("val", "test"), k=100, batch_size=256, doc_emb_path=None, debug=False):
+                 splits=("val", "test"), k=100, batch_size=256, doc_emb_path=None, query_prefix="", debug=False):
     """Embed val/test queries with the student at `path` (checkpoint dir, hub id or "tiny:<seed>"), retrieve top-k
-    from the cached teacher corpus (or doc_emb_path, e.g. the student's native-space corpus) and write
+    from the cached teacher corpus (or doc_emb_path, e.g. the student's native-space corpus, with its query_prefix)
+    and write
     metrics.json into out_dir (default: path). Returns {split: metrics}."""
     out_dir = out_dir or path
     name = name or os.path.basename(os.path.normpath(path))
@@ -96,7 +97,8 @@ def evaluate_dir(path, data_path, emb_dir, dim, max_query_len, device, out_dir=N
     for split in splits:
         teacher_q, _ = load_emb(emb_dir, split)
         n = DEBUG_QUERIES if debug else len(teacher_q)
-        q = encode(model, tokenizer, data[split]["texts"][:n], device, dim, max_query_len, batch_size=batch_size)
+        q = encode(model, tokenizer, data[split]["texts"][:n], device, dim, max_query_len, query_prefix,
+                   batch_size=batch_size)
         result[split] = _split_metrics(q.numpy(), teacher_q[:n], docs, data[split]["pos"][:n], k, device)
     del model
     _write_metrics(out_dir, name, result)
