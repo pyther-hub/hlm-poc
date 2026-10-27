@@ -13,7 +13,7 @@ DATASET = "Tevatron/msmarco-passage"
 
 def slim_row(row):
     """Keep only what we use. negative_passages[0] is the one stored negative
-    (Tevatron-provided; README says its BM25 origin is unverified)."""
+    (Tevatron-provided; doc.md says its BM25 origin is unverified)."""
     def p(x):
         return {"docid": x["docid"], "title": x["title"], "text": x["text"]}
     return {"query_id": row["query_id"], "query": row["query"],

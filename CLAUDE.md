@@ -14,7 +14,8 @@ teacher.py     # TEACHER_DEFAULTS, embed_main (sharded, resumable), merge_shards
 ddp.py         # copied verbatim from tiny-reasoner; keep the API identical
 notebooks/     # phase_1_teacher.ipynb, edited by hand, committed without outputs
 tests/         # CPU, offline; the tiny random Qwen3 + GPT-2 tokenizer live ONLY here (conftest.py)
-README.md      # design + API reference + cfg tables. Update it when a public function or cfg key changes.
+doc.md         # code docs: design + API reference + cfg tables. Update it when a public function or cfg key changes.
+README.md      # the user's own notes on experiments and the project. Do not edit unless asked.
 ```
 
 ## Environment
