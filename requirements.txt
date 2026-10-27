@@ -7,3 +7,6 @@ numpy
 tqdm
 pytest
 nbformat
+# local notebook runner (scripts/run_notebooks_tiny.py)
+nbclient
+ipykernel
