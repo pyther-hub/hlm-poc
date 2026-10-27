@@ -1,4 +1,5 @@
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -62,16 +63,25 @@ def embed(model, input_ids, attention_mask, dim):
 
 @torch.no_grad()
 def encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False):
-    """Unit-norm [N, dim] fp16 CPU tensor in input order. Batches are length-sorted so little compute goes to padding."""
-    from tqdm.auto import tqdm
+    """Unit-norm [N, dim] fp16 CPU tensor in input order. Batches are length-sorted so little compute goes to padding.
+    progress=True prints a line every ~5% of batches (rank 0 only). Plain prints, not tqdm: a tqdm bar drawn in a
+    spawned worker doesn't show up in the notebook. Longest texts go first, so the early ETA is pessimistic."""
     model.eval()
+    #sort in order of token lens for effective gpu batching, then restore original order at the end
     order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
     out = torch.empty(len(texts), dim, dtype=torch.float16)
     use_amp = amp and device.type == "cuda" and next(model.parameters()).dtype == torch.float32
-    for start in tqdm(range(0, len(texts), batch_size), disable=not (progress and is_main()), desc="encode"):
+    n_batches = -(-len(texts) // batch_size)
+    log_every = max(1, n_batches // 20)
+    t0 = time.perf_counter()
+    for b, start in enumerate(range(0, len(texts), batch_size)):
         idx = order[start:start + batch_size]
         enc = tokenize(tokenizer, [texts[i] for i in idx], max_length, prefix)
         with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
             q = embed(model, enc["input_ids"].to(device), enc["attention_mask"].to(device), dim)
         out[idx] = q.half().cpu()
+        if progress and is_main() and ((b + 1) % log_every == 0 or b + 1 == n_batches):
+            elapsed = time.perf_counter() - t0
+            eta = elapsed / (b + 1) * (n_batches - b - 1)
+            print(f"[encode] {b + 1}/{n_batches} batches  {elapsed / 60:.1f} min  eta {eta / 60:.1f} min", flush=True)
     return out

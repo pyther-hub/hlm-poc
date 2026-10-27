@@ -4,7 +4,7 @@ import torch
 
 from conftest import tiny_rows
 from data import build_data, resolve_cfg
-from model import embed, load_encoder, tokenize, truncate_normalize
+from model import embed, encode, load_encoder, tokenize, truncate_normalize
 from teacher import TEACHER_DEFAULTS
 
 DEVICE = torch.device("cpu")
@@ -47,6 +47,13 @@ def test_tokenize_ends_with_eot(encoder):
 def test_truncate_normalize_unit_norm():
     x = truncate_normalize(torch.randn(5, 64) * 7, 16)
     assert x.shape == (5, 16) and torch.allclose(x.norm(dim=-1), torch.ones(5), atol=1e-6)
+
+
+def test_encode_progress_prints_lines(encoder, capsys):
+    model, tok = encoder
+    encode(model, tok, [f"text {i}" for i in range(10)], DEVICE, DIM, 16, batch_size=2, progress=True)
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("[encode]")]
+    assert len(lines) == 5 and lines[-1].startswith("[encode] 5/5 batches")
 
 
 def test_encoder_is_frozen(encoder):
