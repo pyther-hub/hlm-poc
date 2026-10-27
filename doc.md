@@ -4,9 +4,9 @@ A frozen **teacher** (Qwen3-Embedding-4B) embeds the document corpus once. Later
 encoder (Qwen3-Embedding-0.6B) will be trained to retrieve against that frozen index, so documents never need
 re-embedding when the query side changes.
 
-**Current scope: phase 1 only.** Build the MS MARCO data and embed it with the teacher on 2 GPUs. No fine-tuning yet.
-Experiments run on Kaggle (GPU T4 x2). This repo holds the flat, tested functions the notebook imports: plain
-functions, no classes, no global state, no config system.
+**Current scope: phase 1 only.** Build the MS MARCO data, embed it with the teacher on 2 GPUs, and evaluate
+retrieval on val/test against that index. No fine-tuning yet. Experiments run on Kaggle (GPU T4 x2). This repo holds
+the flat, tested functions the notebooks import: plain functions, no classes, no global state, no config system.
 
 ---
 
@@ -14,14 +14,14 @@ functions, no classes, no global state, no config system.
 
 ### 0.1 Modules
 ```
-       notebooks/phase_1_teacher.ipynb  (control panel + 4 steps)
-              │                 │
-       ┌──────▼───┐       ┌─────▼──────┐
-       │ data.py  │       │ teacher.py │  embed_main (sharded, resumable), merge_shards,
-       │ rows,    │       │            │  fp16_sanity, time_embedding
-       │ splits,  │       └─────┬──────┘
-       │ corpus   │             │
-       └────┬─────┘       ┌─────▼────────────────────────────────────┐
+       notebooks/phase_1_teacher.ipynb (4 steps)        notebooks/phase_1_eval.ipynb (5 steps)
+              │                 │                                  │
+       ┌──────▼───┐       ┌─────▼──────┐                  ┌────────▼───────┐
+       │ data.py  │       │ teacher.py │  embed_main,     │ evaluation.py  │  load_index (checks), teacher_ceiling,
+       │ rows,    │       │            │  merge_shards,   │                │  evaluate_model, METRICS, summarize,
+       │ splits,  │       └─────┬──────┘  fp16_sanity,    └────────┬───────┘  measure_latency
+       │ corpus   │             │         time_embedding           │
+       └────┬─────┘       ┌─────▼──────────────────────────────────▼─┐
             └────────────▶│ model.py  load_encoder · tokenize · encode│
                           └─────┬────────────────────────────────────┘
                           ┌─────▼─────┐
@@ -40,6 +40,9 @@ build_data ─▶ data.json
    train/val/test = ids, texts, pos (corpus rows), neg (corpus row)
    ▼
 embed_main (2 GPUs, shard per rank) ─▶ emb/teacher/{corpus,align,val,test}.npy  fp16 [N, 256] + *_ids.json
+   ▼
+phase_1_eval (1 GPU): queries (cached teacher vectors, or any model) → top-100 over the teacher corpus
+   ─▶ runs/<mode>/eval/metrics.json   {row name: {split: metrics}}
 ```
 
 DDP pattern:
@@ -90,6 +93,20 @@ Run with `DEBUG = True` first and check that the last cell shows norms ≈ 1.0 a
 Sessions are capped at 9 h. Every step is resumable: rows are cached as parquet, `data.json` is reused, and
 teacher shards that already exist are skipped.
 
+Then open `notebooks/phase_1_eval.ipynb` with the same `DEBUG` value. It reads the cache built above and needs one GPU.
+
+| Cell | What it does |
+|---|---|
+| Control panel | `DEBUG`, paths, `EVAL` (splits, k, dim, batch size), `MRL_DIMS`, `MODELS` (name → hub id or checkpoint dir + query prefix/length/dtype), `LATENCY` (same entry shape; the teacher entry and `EVAL["dim"]` are read from `TEACHER_DEFAULTS`). |
+| 1 · Load and check | `load_index`: asserts finite, unit-norm vectors, ids in `data.json` order, every positive a valid corpus row. |
+| 2 · Teacher ceiling | Row `teacher` (cached teacher queries vs corpus) + `teacher@d64`, `teacher@d128` (MRL sweep). |
+| 3 · Models | `evaluate_model` per `MODELS` entry. The untrained student is expected near zero (different embedding space). |
+| 4 · Summary | One table per split, teacher first, retention = nDCG@10 / teacher nDCG@10. |
+| 5 · Latency | ms/query and queries/s per batch size, teacher (with its prompt) vs student. |
+
+**Corpus caveat:** the index is only the positives + one stored negative of the core queries (~200k passages), not
+full MS MARCO (8.8M), so absolute scores are higher than published ones. Use them to compare models.
+
 ## 2. Using it locally
 ```bash
 .venv/bin/python -m pytest -q        # CPU, offline, < 30 s
@@ -107,7 +124,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `load_encoder(name, device, dtype=fp32, device_map=None)` | `name` = hub id or local dir. Returns a frozen, eval-mode `(model, tokenizer)`. `AutoModel` with sdpa. A missing local dir raises `FileNotFoundError`. `device_map="auto"` spreads a model over GPUs. |
 | `tokenize(tokenizer, texts, max_length, prefix="")` | Left-padded batch ending in end-of-text (appended if the tokenizer doesn't). |
 | `pool_last_token(hidden, mask)` / `truncate_normalize(x, dim)` / `embed(model, ids, mask, dim)` | Last-token pooling (any padding side) / MRL truncate + L2 / both after a forward. |
-| `encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False)` | No-grad, length-sorted batches; fp16 CPU tensor `[N, dim]` in input order. `progress=True`: a `[encode] b/n batches  elapsed  eta` line every ~5% (rank 0), plain prints so they show from spawned workers. |
+| `encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False)` | No-grad, length-sorted batches; fp16 CPU tensor `[N, dim]` in input order. `progress=True`: a `[encode cuda:0] b/n batches  elapsed  eta` line every ~5% (rank 0 only, labelled with the device), plain prints so they show from spawned workers. |
 | `get_device()`, `DTYPES` | `cuda:0` or CPU; `"fp32"/"fp16"/"bf16"` → torch dtype. |
 
 ### `data.py`
@@ -128,6 +145,18 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `fp16_sanity(model_name, texts, dim, max_len, device, device_map_fp32=None)` | fp16 vs fp32 cosine (mean, min), NaN rows. Use `device_map_fp32="auto"` for the 4B model (16 GB in fp32). |
 | `time_embedding(cfg, data, device, world_size, n_sample=2000, budget_h=5.0)` | tokens/s on a passage sample → projected hours for all sets. Report only. |
 | `free_gpu_memory()` | `gc.collect()` + `torch.cuda.empty_cache()`. |
+
+### `evaluation.py`
+| Function | What it does |
+|---|---|
+| `load_index(data, emb_dir, splits)` | Teacher corpus + query vectors per split, after `check_emb` (finite, unit norm, ids match) and `check_qrels` (positives valid). Returns `(docs, {split: q})`. |
+| `retrieve_topk(queries, docs, k=100, device, chunk=1024)` | Chunked brute-force matmul (fp16 on GPU). |
+| `METRICS`, `compute_metrics(topk_idx, qrels)` | Registry: `recall@{1,5,10,20,50,100}`, `mrr@10`, `ndcg@10` (binary gains, multiple positives); mean per metric. |
+| `truncate(x, dim)` | MRL: first `dim` features, renormalised. |
+| `teacher_ceiling(data, docs, teacher_q, k, device, dims=())` | Rows `teacher` + `teacher@d<dim>` per extra dim. |
+| `evaluate_model(model, data, docs, splits, dim, max_query_len, query_prefix, k, device, dtype, batch_size)` | Any hub id / checkpoint dir → `{split: metrics}`. Frees GPU memory after. |
+| `save_metrics(out_dir, rows)` / `summarize(out_dir, split, retention_metric="ndcg@10")` | Merge rows into `metrics.json` / print one table, teacher first, with retention. |
+| `measure_latency(model, tokenizer, texts, device, dim, max_len, prefix, batch_sizes, repeats=3)` | Median ms/query and queries/s per batch size, with `cuda.synchronize`. |
 
 ### `ddp.py`
 `launch(fn, *args, nprocs)`, `setup`, `cleanup`, `barrier`, `is_main`, `get_rank`, `get_world_size`,
@@ -166,8 +195,13 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_resolve_cfg_rejects_typos` | Typos in a control panel silently ignored. |
 | `test_sharded_embedding_matches_single_process` | 2-process sharded teacher embedding ≠ single process. |
 | `test_rerun_skips_finished_sets` | A re-run re-embeds sets that are already done. |
-| `test_only_phase_1_notebook`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
+| `test_retrieve_topk_matches_numpy`, `test_compute_metrics_by_hand`, `test_truncate_renormalizes` | Retrieval / metric / MRL bugs. |
+| `test_check_emb_rejects_bad_inputs` | Sanity checks that don't catch bad norms or misaligned ids. |
+| `test_eval_flow` | The eval notebook's flow on a tiny index; the teacher model through `evaluate_model` reproduces the cached ceiling. |
+| `test_measure_latency_runs` | Latency helper. |
+| `test_expected_notebooks`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
 
 ## 6. Workflow
 1. Edit locally → `.venv/bin/python -m pytest -q` → commit → push.
 2. On Kaggle: re-run the setup cell, run with `DEBUG = True`, then `DEBUG = False`.
+3. After the teacher index exists: run `phase_1_eval` with the same `DEBUG` value.
