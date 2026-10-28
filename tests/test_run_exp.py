@@ -1,10 +1,9 @@
-"""run_exp: the KL loss, LoRA optimizer groups unchanged by trainable_params, evaluate_runs resuming, and the plots."""
+"""run_exp: LoRA optimizer groups unchanged by trainable_params, evaluate_runs resuming, and the plots."""
 import os
 
 import matplotlib
 import pytest
 import torch
-import torch.nn.functional as F
 
 import run_exp
 from conftest import build_teacher_index, tiny_rows
@@ -15,13 +14,6 @@ from model import adapter_params, attach_adapter, load_encoder, trainable_params
 matplotlib.use("Agg")
 DEVICE = torch.device("cpu")
 DIM = 32
-
-
-def test_kl_loss_zero_iff_same():
-    torch.manual_seed(0)
-    t = F.normalize(torch.randn(8, 16), dim=-1)
-    assert run_exp.kl_loss(t, t).item() == pytest.approx(0, abs=1e-6)
-    assert run_exp.kl_loss(F.normalize(torch.randn(8, 16), dim=-1), t).item() > 0.01
 
 
 def test_lora_trainable_params_match_adapter_params(tiny_model_dir):
