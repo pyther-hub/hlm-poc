@@ -1,4 +1,5 @@
 """MS MARCO (Tevatron/msmarco-passage, train split) → by-query splits, corpus, alignment queries.
+The corpus is every core query's passages plus random distractors from Tevatron/msmarco-passage-corpus (8.8M).
 Passages are referred to everywhere by their row in the corpus table (data["corpus"]["ids"][i]).
 Also holds the small I/O helpers for the cached artifacts (data.json, embedding .npy files, cfg merging)."""
 import json
@@ -7,6 +8,7 @@ import os
 import numpy as np
 
 DATASET = "Tevatron/msmarco-passage"
+CORPUS = "Tevatron/msmarco-passage-corpus"
 
 
 # ---------- rows ----------
@@ -47,6 +49,22 @@ def load_rows(n_rows, cache_dir):
     return pq.read_table(path).to_pylist()
 
 
+def load_distractors(n, seed, cache_dir):
+    """n passages sampled (seeded, without replacement) from the full corpus, cached as parquet."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    path = os.path.join(cache_dir, f"distractors_{n}_{seed}.parquet")
+    if not os.path.exists(path):
+        from datasets import load_dataset
+        ds = load_dataset(CORPUS, split="train")
+        idx = np.sort(np.random.default_rng(seed).choice(len(ds), n, replace=False))
+        rows = [{"docid": r["docid"], "title": r["title"], "text": r["text"]} for r in ds.select(idx).to_list()]
+        os.makedirs(cache_dir, exist_ok=True)
+        pq.write_table(pa.Table.from_pylist(rows), path + ".tmp")
+        os.replace(path + ".tmp", path)
+    return pq.read_table(path).to_pylist()
+
+
 # ---------- splits, corpus, query sets ----------
 
 def make_splits(n_rows, core_n, n_val, n_test, split_seed):
@@ -61,15 +79,15 @@ def passage_text(p, use_title):
     return f"{title}. {p['text']}" if use_title and title not in ("", "-") else p["text"]
 
 
-def build_corpus(rows, core_idx, use_title=False):
-    """All positives of the core queries + their stored negative, deduplicated by docid."""
+def build_corpus(rows, core_idx, distractors=(), use_title=False):
+    """All positives of the core queries + their stored negative, then the distractors, deduplicated by docid."""
     ids, texts, index = [], [], {}
-    for i in core_idx:
-        for p in rows[i]["positives"] + [rows[i]["negative"]]:
-            if p["docid"] not in index:
-                index[p["docid"]] = len(ids)
-                ids.append(p["docid"])
-                texts.append(passage_text(p, use_title))
+    passages = [p for i in core_idx for p in rows[i]["positives"] + [rows[i]["negative"]]] + list(distractors)
+    for p in passages:
+        if p["docid"] not in index:
+            index[p["docid"]] = len(ids)
+            ids.append(p["docid"])
+            texts.append(passage_text(p, use_title))
     return {"ids": ids, "texts": texts}, index
 
 
@@ -95,14 +113,17 @@ def alignment_queries(rows, split, n_align):
     return {"ids": [rows[i]["query_id"] for i in idx], "texts": [rows[i]["query"] for i in idx]}
 
 
-def build_data(rows, core_n, n_val, n_test, n_align, split_seed, use_title=False):
+def build_data(rows, core_n, n_val, n_test, n_align, split_seed, use_title=False, distractors=()):
     split = make_splits(len(rows), core_n, n_val, n_test, split_seed)
-    corpus, doc_index = build_corpus(rows, split["train"] + split["val"] + split["test"], use_title)
+    core_idx = split["train"] + split["val"] + split["test"]
+    n_core = len(build_corpus(rows, core_idx)[0]["ids"])
+    corpus, doc_index = build_corpus(rows, core_idx, distractors, use_title)
     data = {"corpus": corpus, "align": alignment_queries(rows, split, n_align)}
     for name in ("train", "val", "test"):
         data[name] = query_set(rows, split[name], doc_index)
-    print(f"[data] corpus={len(corpus['ids'])} train={len(split['train'])} val={len(split['val'])} "
-          f"test={len(split['test'])} align={len(data['align']['ids'])}")
+    print(f"[data] corpus={len(corpus['ids'])} (distractors {len(corpus['ids']) - n_core}) "
+          f"train={len(split['train'])} val={len(split['val'])} test={len(split['test'])} "
+          f"align={len(data['align']['ids'])}")
     return data
 
 

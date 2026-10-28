@@ -84,6 +84,18 @@ def test_corpus_has_positives_and_negatives(rows, data):
             assert corpus[neg] == by_id[qid]["negative"]["docid"]
 
 
+def test_corpus_includes_distractors(rows, data):
+    core = data["corpus"]["ids"]
+    distractors = [{"docid": core[0], "title": "-", "text": "duplicate of a core passage"}] + \
+                  [{"docid": f"x{i}", "title": "-", "text": f"distractor {i}"} for i in range(5)]
+    with_d = build_data(rows, core_n=40, n_val=6, n_test=6, n_align=50, split_seed=1, distractors=distractors)
+    ids = with_d["corpus"]["ids"]
+    assert ids == core + [f"x{i}" for i in range(5)], "core passages first, distractors appended once"
+    assert with_d["corpus"]["texts"][0] == data["corpus"]["texts"][0], "a duplicate docid keeps the core text"
+    for split in ("train", "val", "test"):
+        assert with_d[split]["pos"] == data[split]["pos"] and with_d[split]["neg"] == data[split]["neg"]
+
+
 def test_alignment_queries_exclude_val_test(data):
     align = set(data["align"]["ids"])
     assert set(data["train"]["ids"]) <= align

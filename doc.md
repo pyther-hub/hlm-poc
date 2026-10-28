@@ -7,7 +7,7 @@ the query side changes.
 **Current scope.** Phase 1: build the MS MARCO data, embed it with the teacher on 2 GPUs, and evaluate retrieval on
 val/test against that index. Phase 2: alignment fine-tuning of the student (LoRA r=16 + linear head, DDP) onto the
 teacher's query vectors. Phase 3: contrastive refinement of that adapter against the frozen teacher document vectors. Pruning 28→14→7 with full fine-tune (`prune.py`), before/after CR, latency and cos(q, d+) (`run_exp.py`).
-Notebooks `00`–`04` (§1). Everything runs on Kaggle (GPU T4 x2). This repo holds
+Notebooks `01`–`04` (§1). Everything runs on Kaggle (GPU T4 x2). This repo holds
 the flat, tested functions the notebooks import: plain functions, no classes, no global state, no config system.
 
 ---
@@ -16,7 +16,7 @@ the flat, tested functions the notebooks import: plain functions, no classes, no
 
 ### 0.1 Modules
 ```
- 00, 01 (data, teacher)        00, 02, 04 (eval)          02 (align)              03 (refine)
+ 01 (data, teacher)            01, 02, 04 (eval)          02 (align)              03 (refine)
       │            │                    │                          │                       │
  ┌────▼─────┐ ┌────▼───────┐    ┌───────▼────────┐          ┌──────▼──────┐         ┌──────▼──────┐
  │ data.py  │ │ teacher.py │    │ evaluation.py  │◀─────────│  align.py   │◀────────│  refine.py  │
@@ -37,10 +37,11 @@ the flat, tested functions the notebooks import: plain functions, no classes, no
 ### 0.2 Data flow
 ```
 Tevatron/msmarco-passage train  ─ stream first 210k rows ─▶ rows_210000.parquet  (query_id, query, positives, negative[0])
+Tevatron/msmarco-passage-corpus ─ 500k seeded random rows (split_seed) ─▶ distractors_500000_1234.parquet
    │ make_splits (split_seed)      core 100k → train 90k / val 5k / test 5k;  other 110k
    ▼
 build_data ─▶ data.json
-   corpus  = positives of core queries + their stored negative, dedup by docid      (~200k passages)
+   corpus  = positives of core queries + their stored negative, then the distractors, dedup by docid  (~700k)
    align   = 90k train + up to 110k other queries, never a val/test query (id or text)  (200k)
    train/val/test = ids, texts, pos (corpus rows), neg (corpus row)
    ▼
@@ -76,8 +77,8 @@ notebook ── launch(embed_main, TEACHER) ──▶ mp.spawn ─┬─ rank 0 
 ### 0.3 Modes
 | Mode | Set in the control panel | What changes |
 |---|---|---|
-| Full | `DEBUG=False` | 210k rows, ~200k passages. Dir `cache/full`. |
-| Debug | `DEBUG=True` (default) | Same 4B teacher, ~10k passages. Dir `cache/debug`. |
+| Full | `DEBUG=False` | First 210k of the 400.8k train rows; ~200k core passages + 500k distractors. Dir `cache/full`. |
+| Debug | `DEBUG=True` (default) | Same 4B teacher, ~10k core passages + 20k distractors. Dir `cache/debug`. |
 | Tests | `pytest` | CPU, offline, a random 2-layer Qwen3 saved to a tmp dir (tests only), < 30 s. |
 
 ### 0.4 Verified against the Hub (2026-10-27)
@@ -91,15 +92,17 @@ notebook ── launch(embed_main, TEACHER) ──▶ mp.spawn ─┬─ rank 0 
 | Dimensions / MRL | 4B: 2560, 0.6B: 1024; MRL supports 32..max | model cards |
 | Architecture | `qwen3` (`Qwen3ForCausalLM` checkpoint, loaded with `AutoModel`), transformers ≥ 4.51 (we require ≥ 4.56 for the `dtype=` kwarg) | `config.json`, model card |
 | Dataset | `Tevatron/msmarco-passage` train: 400.8k rows in one `train.jsonl.gz` (1.7 GB); fields `query_id, query, positive_passages[{docid,title,text}], negative_passages[...]` (~30 negatives per row) | Hub dataset viewer |
+| Dataset `validation` split | 7.0k queries, `positive_passages` / `negative_passages` are **null**: unscoreable without external qrels, so val/test are held out from train | Hub dataset viewer (2026-10-28) |
+| Corpus | `Tevatron/msmarco-passage-corpus` train: 8.8M rows, fields `docid, title, text` (docid `"0"`, `"1"`, …, the same ids as the train set's passages) | Hub dataset viewer (2026-10-28) |
 | **Not verified** | That `negative_passages` are **BM25** negatives, and their order. The dataset README is empty. We use `negative_passages[0]` and call it the "stored negative". | — |
 
 ---
 
 ## 1. Using it on Kaggle
-Five notebooks, one Kaggle session each, run in order. Notebook settings: **Accelerator → GPU T4 x2**, **Internet ON**.
+Four notebooks, one Kaggle session each, run in order. Notebook settings: **Accelerator → GPU T4 x2**, **Internet ON**.
 Cell 1 clones the repo (`git pull` on later runs), upgrades `transformers` if older than 4.56 (restart the kernel once
 if it says so) and installs `datasets`, `pyarrow`, `accelerate` if missing. Cell 2 is the control panel. Run everything
-with `DEBUG = True` first, then `DEBUG = False`; use the same value in all five.
+with `DEBUG = True` first, then `DEBUG = False`; use the same value in all four.
 
 **Chaining.** Each notebook writes under `/kaggle/working` (`cache/<mode>/...`, `runs/<mode>/...`). Save the version,
 then attach it as an input to the next notebook and set that notebook's `IN_<nn>` slug in the control panel
@@ -107,17 +110,16 @@ then attach it as an input to the next notebook and set that notebook's `IN_<nn>
 place; the small `runs/<mode>/metrics.json` is copied forward once, so rows accumulate and are never re-evaluated.
 Off Kaggle every `IN_*` is the repo dir.
 ```
-00 ─ data.json, metrics(base_student_own_index) ─▶ 01 ─ data.json, emb/teacher/*.npy, metrics(+teacher)
+01 ─ data.json, emb/teacher/*.npy, metrics(teacher)
    ─▶ 02 ─ aligned/, prog_l14/, prog_l7/ ─▶ 03 ─ <student>_cr/ ─▶ 04 (reads 01, 02, 03)
 ```
 
 | Notebook | GPUs | Cells |
 |---|---|---|
-| `00_data_audit_and_retrieval_baseline` | 2 | Build `data.json` (`load_rows` → `build_data`) · audit (sample triples, positives per query, token lengths) · leakage asserts (splits disjoint by id, align has no val/test query by id or text; shared positives only reported) · baseline: `launch(embed_main, ...)` with the untrained 0.6B at d=1024 into `emb/student_base`, `score` on its own index → row `base_student_own_index`. |
-| `01_generate_teacher_embeddings` | 2 | Teacher **inference** (no training). Copy `data.json` from 00 · `fp16_sanity` + `time_embedding` · `launch(embed_main, TEACHER)` (resumable shards) · validate shape / finite / norms / ids per set · `teacher_ceiling` → row `teacher`. |
+| `01_generate_teacher_embeddings` | 2 | Build `data.json` (`load_rows` + `load_distractors` → `build_data`) · audit (set sizes, sample triples, core vs distractor passages, positives per query, token lengths) · leakage asserts (splits disjoint by id, align has no val/test query by id or text; shared positives only reported) · teacher **inference** (no training): `fp16_sanity` + `time_embedding` · `launch(embed_main, TEACHER)` (resumable shards) · validate shape / finite / norms / ids per set · `teacher_ceiling` → row `teacher`. |
 | `02_student_alignment_and_pruning` | 2 | `train_once(align_main, ALIGN)` → `aligned` (LoRA + head, L2) · for n in `STAGES` (14, 7): `train_once(prune_main, ...)` from the previous stage → `prog_l<n>` (full fine-tune, L2, `ffn_keep=1.0`) · curves · `evaluate_runs` + `print_rows` · `measure_latency` per stage. |
 | `03_contrastive_refinement` | 2 | Show train triples · `exp_cr(REFINE, STUDENTS, ...)`: `refine_main` from each of `aligned`, `prog_l14`, `prog_l7` → `<student>_cr`, gains vs the pre-refinement row, bars + curves. |
-| `04_retrieval_evaluation_and_ablation` | 1 | `evaluate_runs` fills missing rows · `summarize` val/test · `exp_latency` (teacher first: params, fp16 MB, ms/query, q/s, speedup, cos(q, d+)) · ablation table (alignment, each prune cut, each refinement; ndcg@10 and recall@100) + bars. |
+| `04_retrieval_evaluation_and_ablation` | 1 | `evaluate_runs` fills missing rows · `summarize` val/test · `exp_latency` (teacher first: params, fp16 MB, ms/query, q/s, speedup, cos(q, d+)) · ablation table (each prune cut, each refinement; ndcg@10 and recall@100) + bars. |
 
 Sessions are capped at 9 h. Every training / embedding step is resumable (`step_<n>/` checkpoints, existing shards
 skipped) and a finished stage (`final/` exists) is skipped.
@@ -134,7 +136,7 @@ L        = CE(logits, own positive) + l2_weight · ||q_i − teacher(q_i)||²
 vectors) and are picked in the control panel with `loss` / `loss_kwargs`. They can't be defined in a notebook cell:
 the DDP workers are spawned processes and only receive importable functions.
 
-Rows: `base_student_own_index` (00), `teacher` (01), `aligned`, `prog_l14`, `prog_l7` (02), `<student>_cr` (03).
+Rows: `teacher` (01), `aligned`, `prog_l14`, `prog_l7` (02), `<student>_cr` (03).
 "P@100" is reported as `recall@100` (~1 positive per query, so precision@100 ≤ 0.01).
 
 **Pruning** (`prune.py`): from an adapter dir, LoRA merged into the base (`merge_lora`) or a previous pruned stage;
@@ -144,8 +146,9 @@ checkpoint is an adapter dir with `full: true`, `keep_layers`, `ffn_idx` (indice
 state dict in `adapter.pt`; `load_encoder` rebuilds it from the base id. Progressive = chained stages; direct = one
 cut with `ffn_keep ** stages` so the final shape matches.
 
-**Corpus caveat:** the index is only the positives + one stored negative of the core queries (~200k passages), not
-full MS MARCO (8.8M), so absolute scores are higher than published ones. Use them to compare models.
+**Corpus caveat:** the index is the positives + one stored negative of the core queries (~200k passages) plus 500k
+random passages of full MS MARCO, not all 8.8M, so absolute scores are higher than published ones. Use them to compare
+models. Random distractors can be unlabelled relevant passages (false negatives).
 
 ## 2. Using it locally
 ```bash
@@ -172,9 +175,10 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 |---|---|
 | `load_rows(n_rows, cache_dir)` | Stream the first `n_rows`, `clean_rows` (keep `negative_passages[0]`, drop incomplete rows, dedupe by `query_id`), cache as parquet. |
 | `make_splits(n_rows, core_n, n_val, n_test, split_seed)` | Row indices: `train`, `val`, `test` (from the seeded core sample) and `other`. |
-| `build_corpus(rows, core_idx, use_title)` | Positives + stored negative of the core queries, deduplicated by docid. |
+| `load_distractors(n, seed, cache_dir)` | `n` passages sampled (seeded, no replacement) from `Tevatron/msmarco-passage-corpus` (downloads the 8.8M corpus once), cached as parquet. |
+| `build_corpus(rows, core_idx, distractors=(), use_title=False)` | Positives + stored negative of the core queries, then the distractors, deduplicated by docid (core passages keep the first rows). |
 | `alignment_queries(rows, split, n_align)` | Train + other queries, excluding val/test by id and by text. |
-| `build_data(rows, core_n, n_val, n_test, n_align, split_seed, use_title=False)` | All of the above → the `data.json` dict: `corpus`, `align`, `train`/`val`/`test` (`ids`, `texts`, `pos`, `neg`). |
+| `build_data(rows, core_n, n_val, n_test, n_align, split_seed, use_title=False, distractors=())` | All of the above → the `data.json` dict: `corpus`, `align`, `train`/`val`/`test` (`ids`, `texts`, `pos`, `neg`). |
 | `load_emb(emb_dir, name)`, `save_json`, `load_json`, `resolve_cfg(defaults, cfg)` | I/O; `resolve_cfg` raises on unknown keys. |
 
 ### `teacher.py`
@@ -260,8 +264,9 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `sets` | `("corpus", "align", "val", "test")` | Embedded and merged. |
 
 ### 4.2 `DATA` (control panel)
-`n_rows=210_000`, `core_n=100_000`, `n_val=5_000`, `n_test=5_000`, `n_align=200_000`, `split_seed=1234`,
-`use_title=False`. Debug: `12_000 / 5_000 / 500 / 500 / 10_000` (~10k passages).
+`n_rows=210_000`, `core_n=100_000`, `n_val=5_000`, `n_test=5_000`, `n_align=200_000`, `n_distractors=500_000`,
+`split_seed=1234` (also seeds the distractor sample), `use_title=False`. Debug: `12_000 / 5_000 / 500 / 500 / 10_000 /
+20_000` (~30k passages).
 
 ### 4.3 `CHECKS` (control panel)
 `sanity_n=1000` passages for the fp16 check, `timing_n=2000` passages timed, `budget_h=5.0` (reported only).
@@ -311,7 +316,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 |---|---|
 | `test_pooling_padding_invariant`, `test_tokenize_ends_with_eot` | Pooling depends on padding; pooled token isn't end-of-text. |
 | `test_truncate_normalize_unit_norm`, `test_encoder_is_frozen`, `test_missing_model_dir_fails_fast` | Non-unit vectors; teacher not frozen; silent missing dir. |
-| `test_splits_disjoint_by_query`, `test_corpus_has_positives_and_negatives`, `test_alignment_queries_exclude_val_test` | Leakage between splits, missing positives/negatives, val/test queries in alignment. |
+| `test_splits_disjoint_by_query`, `test_corpus_has_positives_and_negatives`, `test_corpus_includes_distractors`, `test_alignment_queries_exclude_val_test` | Leakage between splits, missing positives/negatives, distractors shifting or duplicating core passages, val/test queries in alignment. |
 | `test_resolve_cfg_rejects_typos` | Typos in a control panel silently ignored. |
 | `test_sharded_embedding_matches_single_process` | 2-process sharded teacher embedding ≠ single process. |
 | `test_rerun_skips_finished_sets` | A re-run re-embeds sets that are already done. |
@@ -333,6 +338,6 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 
 ## 6. Workflow
 1. Edit locally → `.venv/bin/python -m pytest -q` → commit → push.
-2. On Kaggle run `00` → `01` → `02` → `03` → `04`, each with `DEBUG = True`; after each, *Save Version* and attach it
+2. On Kaggle run `01` → `02` → `03` → `04`, each with `DEBUG = True`; after each, *Save Version* and attach it
    as an input to the next (set `IN_<nn>`).
 3. Repeat with `DEBUG = False`.

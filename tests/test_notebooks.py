@@ -6,7 +6,7 @@ import nbformat
 import pytest
 
 NB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks")
-NOTEBOOKS = ["00_data_audit_and_retrieval_baseline.ipynb", "01_generate_teacher_embeddings.ipynb",
+NOTEBOOKS = ["01_generate_teacher_embeddings.ipynb",
              "02_student_alignment_and_pruning.ipynb", "03_contrastive_refinement.ipynb",
              "04_retrieval_evaluation_and_ablation.ipynb"]
 
