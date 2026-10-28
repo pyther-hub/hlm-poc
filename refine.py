@@ -9,6 +9,7 @@ negatives: q_i's other labelled positives and anything scoring above s(q_i, d_i+
 Same loop, checkpoints and resume as align.py (align.run)."""
 import functools
 import os
+import traceback
 
 import numpy as np
 import torch
@@ -89,6 +90,9 @@ def refine_main(rank, world_size, cfg):
     try:
         if not final_exists(cfg["out_dir"]):
             train(rank, world_size, cfg, device)
+    except BaseException:
+        traceback.print_exc()  # print now: cleanup() can hang while another rank waits, hiding this
+        raise
     finally:
         cleanup()
 

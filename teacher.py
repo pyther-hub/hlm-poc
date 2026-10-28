@@ -2,6 +2,7 @@
 Output per set: emb_dir/<set>.npy (fp16, unit norm, [N, dim]) + <set>_ids.json, in data.json order."""
 import os
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -71,6 +72,9 @@ def embed_main(rank, world_size, cfg):
             for name in cfg["sets"]:
                 merge_shards(cfg["emb_dir"], name, world_size, data[name]["ids"])
         barrier()
+    except BaseException:
+        traceback.print_exc()  # print now: cleanup() can hang while another rank waits, hiding this
+        raise
     finally:
         cleanup()
 

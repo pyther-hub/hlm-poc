@@ -6,6 +6,7 @@ format with full=True plus keep_layers / ffn_idx (indices into the hub base), so
 model from the base id. Same loop, checkpoints and resume as align.py (align.run)."""
 import functools
 import os
+import traceback
 
 import numpy as np
 import torch
@@ -87,6 +88,9 @@ def prune_main(rank, world_size, cfg):
     try:
         if not final_exists(cfg["out_dir"]):
             train(rank, world_size, cfg, device)
+    except BaseException:
+        traceback.print_exc()  # print now: cleanup() can hang while another rank waits, hiding this
+        raise
     finally:
         cleanup()
 

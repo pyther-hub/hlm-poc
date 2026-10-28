@@ -11,6 +11,7 @@ import math
 import os
 import shutil
 import time
+import traceback
 
 import numpy as np
 import torch
@@ -82,6 +83,9 @@ def align_main(rank, world_size, cfg):
     try:
         if not final_exists(cfg["out_dir"]):
             train(rank, world_size, cfg, device)
+    except BaseException:
+        traceback.print_exc()  # print now: cleanup() can hang while another rank waits, hiding this
+        raise
     finally:
         cleanup()
 
