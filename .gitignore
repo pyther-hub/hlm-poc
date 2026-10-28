@@ -11,3 +11,4 @@ cache/
 *.safetensors
 *.npy
 *.parquet
+kaggle_runs/

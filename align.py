@@ -18,8 +18,8 @@ import torch
 from data import load_emb, load_json, resolve_cfg
 from ddp import barrier, cleanup, is_main, reduce_mean, setup, wrap_ddp
 from evaluation import score
-from model import (TRAINER_STATE, adapter_params, attach_adapter, embed, encode, load_adapter_weights, load_encoder,
-                   save_adapter, tokenize)
+from model import (TRAINER_STATE, attach_adapter, embed, encode, load_adapter_weights, load_encoder, save_adapter,
+                   tokenize, trainable_params)
 
 ALIGN_DEFAULTS = dict(
     model="Qwen/Qwen3-Embedding-0.6B",  # student base: hub id or local dir; frozen, fp32 (amp does the speed-up)
@@ -138,15 +138,15 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
     whole global batch (same on every rank), global_idx[local] this rank's share. Each epoch is one seeded
     permutation; the ragged tail is dropped so every rank runs the same steps. Logs / evals / saves on rank 0;
     resumes from the latest step checkpoint; writes <out_dir>/final at the end."""
-    lora, head = adapter_params(model)
-    params = lora + head
+    body, head = trainable_params(model)  # LoRA + head, or every weight + head for a fully trained model
+    params = body + head
     bs = cfg["batch_size"]
     per_step = bs * world_size
     steps_per_epoch = n_items // per_step
     total = steps_per_epoch * cfg["epochs"]
     assert total > 0, f"{n_items} examples < one global batch of {per_step}"
     warmup = int(cfg["warmup_ratio"] * total)
-    opt = torch.optim.AdamW([{"params": lora, "lr": cfg["lr"]}, {"params": head, "lr": cfg["head_lr"]}],
+    opt = torch.optim.AdamW([{"params": body, "lr": cfg["lr"]}, {"params": head, "lr": cfg["head_lr"]}],
                             weight_decay=cfg["weight_decay"])
     sched = torch.optim.lr_scheduler.LambdaLR(opt, functools.partial(lr_factor, warmup=warmup, total=total))
     use_amp = cfg["amp"] and device.type == "cuda"

@@ -126,6 +126,11 @@ def attach_adapter(model, rank, alpha, dropout, targets, out_dim):
             m.register_forward_hook(functools.partial(_lora_hook, alpha / rank, dropout))
             n += 1
     assert n, f"no nn.Linear matches lora targets {targets}"
+    return attach_head(model, out_dim)
+
+
+def attach_head(model, out_dim):
+    """Linear(hidden -> out_dim) on the final norm's output, so model(...).last_hidden_state is out_dim wide."""
     w = model.norm.weight
     model.align_head = nn.Linear(model.config.hidden_size, out_dim, dtype=w.dtype, device=w.device)
     model.norm.register_forward_hook(functools.partial(_head_hook, model.align_head))
@@ -142,14 +147,60 @@ def adapter_params(model):
     return [p for k, p in named if ".lora_" in k], [p for k, p in named if k.startswith("align_head.")]
 
 
+def trainable_params(model):
+    """(body params, head params) among those with requires_grad. With a frozen base the body is the LoRA params,
+    in the same order as adapter_params; with a fully trained model it is every base weight."""
+    named = [(k, p) for k, p in model.named_parameters() if p.requires_grad]
+    return [p for k, p in named if not k.startswith("align_head.")], [p for k, p in named if k.startswith("align_head.")]
+
+
+def merge_lora(model, path):
+    """Fold the LoRA of adapter dir `path` into model's base weights (W += alpha/rank * B @ A), no hooks, and attach
+    its head. The result is a plain model + head, ready to prune or fully train."""
+    with open(os.path.join(path, ADAPTER_CONFIG)) as f:
+        cfg = json.load(f)
+    state = torch.load(os.path.join(path, ADAPTER_WEIGHTS), map_location="cpu")
+    modules = dict(model.named_modules())
+    with torch.no_grad():
+        for key in [k for k in state if k.endswith(".lora_A")]:
+            w = modules[key[:-len(".lora_A")]].weight
+            delta = state[key[:-1] + "B"].float() @ state[key].float() * (cfg["alpha"] / cfg["rank"])
+            w += delta.to(w.dtype).to(w.device)
+    attach_head(model, cfg["out_dim"])
+    model.align_head.load_state_dict({k[len("align_head."):]: v for k, v in state.items()
+                                      if k.startswith("align_head.")})
+    return model
+
+
+def prune_model(model, keep_layers, ffn_idx):
+    """In place: keep decoder layers keep_layers (indices into model.layers), and in kept layer j only the FFN
+    neurons ffn_idx[j] (same count in every layer: Qwen3 has one intermediate_size). Updates the config."""
+    layers = [model.layers[i] for i in keep_layers]
+    for j, (layer, idx) in enumerate(zip(layers, ffn_idx)):
+        mlp = layer.mlp
+        idx = torch.as_tensor(idx, device=mlp.up_proj.weight.device)
+        for lin, dim in ((mlp.gate_proj, 0), (mlp.up_proj, 0), (mlp.down_proj, 1)):
+            lin.weight = nn.Parameter(lin.weight.index_select(dim, idx).clone(), lin.weight.requires_grad)
+            lin.in_features, lin.out_features = lin.weight.shape[1], lin.weight.shape[0]
+        mlp.intermediate_size = len(idx)
+        layer.self_attn.layer_idx = j
+    config = model.config
+    if getattr(config, "layer_types", None):
+        config.layer_types = [config.layer_types[i] for i in keep_layers]
+    config.num_hidden_layers, config.intermediate_size = len(layers), len(ffn_idx[0])
+    model.layers = nn.ModuleList(layers)
+    return model
+
+
 def save_adapter(model, path, adapter_cfg, trainer_state=None):
     """Adapter weights + config (+ optional trainer_state for resuming) into dir `path`, written to path.tmp and
-    swapped in, so a crash never leaves a half-written checkpoint."""
+    swapped in, so a crash never leaves a half-written checkpoint. adapter_cfg["full"] = the whole state dict
+    (a fully trained, e.g. pruned, model), else only the adapter keys."""
     tmp = path + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     os.makedirs(tmp)
-    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items() if is_adapter_key(k)},
-               os.path.join(tmp, ADAPTER_WEIGHTS))
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()
+                if adapter_cfg.get("full") or is_adapter_key(k)}, os.path.join(tmp, ADAPTER_WEIGHTS))
     with open(os.path.join(tmp, ADAPTER_CONFIG), "w") as f:
         json.dump(adapter_cfg, f, indent=1)
     if trainer_state is not None:
@@ -159,18 +210,26 @@ def save_adapter(model, path, adapter_cfg, trainer_state=None):
 
 
 def load_adapter_weights(model, path):
+    with open(os.path.join(path, ADAPTER_CONFIG)) as f:
+        full = json.load(f).get("full", False)
     missing, unexpected = model.load_state_dict(
         torch.load(os.path.join(path, ADAPTER_WEIGHTS), map_location=next(model.parameters()).device), strict=False)
-    missing = [k for k in missing if is_adapter_key(k)]
+    missing = [k for k in missing if full or is_adapter_key(k)]
     assert not missing and not unexpected, f"adapter mismatch: missing {missing}, unexpected {unexpected}"
 
 
 def load_adapter(path, device, dtype=torch.float32):
-    """Base model from adapter_config.json + the saved adapter. Frozen, eval mode."""
+    """Base model from adapter_config.json + the saved adapter. Frozen, eval mode. A config with keep_layers /
+    ffn_idx (indices into the base) is pruned first; full=True has no LoRA, the saved weights replace the base."""
     with open(os.path.join(path, ADAPTER_CONFIG)) as f:
         cfg = json.load(f)
     model, tokenizer = load_encoder(cfg["base"], device, dtype)
-    attach_adapter(model, cfg["rank"], cfg["alpha"], cfg["dropout"], cfg["targets"], cfg["out_dim"])
+    if "keep_layers" in cfg:
+        prune_model(model, cfg["keep_layers"], cfg["ffn_idx"])
+    if cfg.get("full"):
+        attach_head(model, cfg["out_dim"])
+    else:
+        attach_adapter(model, cfg["rank"], cfg["alpha"], cfg["dropout"], cfg["targets"], cfg["out_dim"])
     load_adapter_weights(model, path)
     model.requires_grad_(False)
     return model.eval(), tokenizer

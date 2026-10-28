@@ -20,7 +20,7 @@ from ddp import cleanup, setup
 from model import ADAPTER_CONFIG, adapter_params, embed, tokenize
 
 REFINE_DEFAULTS = dict(
-    init_adapter="runs/align/final",    # phase-2 adapter dir: base model + LoRA + head, trained further
+    init_adapter="runs/align/final",    # phase-2 adapter dir (LoRA + head trained further) or a pruned one (all weights)
     dim=256,                            # must equal the adapter's head output and the teacher index dim
     query_prefix="",                    # must match phase 2
     max_query_len=32,
@@ -108,9 +108,12 @@ def train(rank, world_size, cfg, device):
     adapter_cfg = load_json(os.path.join(cfg["init_adapter"], ADAPTER_CONFIG))
     assert adapter_cfg["out_dim"] == cfg["dim"] == docs.shape[1], \
         f"adapter dim {adapter_cfg['out_dim']}, cfg dim {cfg['dim']}, teacher dim {docs.shape[1]}"
-    lora, head = adapter_params(model)
-    for p in lora + head:
-        p.requires_grad_(True)
+    if adapter_cfg.get("full"):  # a pruned, fully trained student: keep training every weight
+        model.requires_grad_(True)
+    else:
+        lora, head = adapter_params(model)
+        for p in lora + head:
+            p.requires_grad_(True)
     docs = torch.from_numpy(docs).to(device)
     neg = mine_negatives(teacher_q, docs.float(), queries["pos"], queries["neg"], cfg["n_neg"])  # same on every rank
     batch_loss = functools.partial(_refine_batch_loss, tokenizer=tokenizer, queries=queries, neg=neg,
