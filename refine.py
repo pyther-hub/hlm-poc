@@ -2,7 +2,8 @@
 L_CR = -1/B sum_i log exp(s(q_i, d_i+)/tau) / (exp(s(q_i, d_i+)/tau) + sum_{u in N_i} exp(s_u/tau)),
 s(q, d) = <student(q), teacher(d)>, documents = the frozen teacher corpus vectors (corpus.npy, never re-encoded),
 plus l2_weight * L2(student q, teacher q) to stay near the teacher query space.
-N_i = every doc of the global batch other than d_i+ (each query's positive + its stored negative[0]; the global batch
+N_i = every doc of the global batch other than d_i+ (each query's positive + its n_neg negatives: the stored
+negative[0] plus n_neg - 1 mined by teacher score, see mine_negatives; the global batch
 is the same on every rank, so these are free) + the other student queries on this rank (same tower), minus false
 negatives: q_i's other labelled positives and anything scoring above s(q_i, d_i+) + margin.
 Same loop, checkpoints and resume as align.py (align.run)."""
@@ -25,6 +26,7 @@ REFINE_DEFAULTS = dict(
     max_query_len=32,
     tau=0.05,                           # temperature
     margin=0.1,                         # negative with s > s(q, d+) + margin is masked as a false negative
+    n_neg=1,                            # negatives per query: 1 = the stored one, k > 1 adds k-1 teacher-mined ones
     l2_weight=0.1,                      # weight of L2(student q, teacher q); 0 = pure L_CR
     lr=5e-5,                            # LoRA params
     head_lr=1e-4,                       # head params
@@ -63,6 +65,23 @@ def contrastive_loss(q, docs, pos_col, known_pos, tau, margin):
     return F.cross_entropy(logits / tau, pos_col), masked
 
 
+def mine_negatives(teacher_q, docs, pos, neg, n_neg, chunk=256):
+    """[N, n_neg] corpus rows per query: the stored negative first, then the n_neg - 1 corpus docs the teacher scores
+    highest for that query (teacher query . teacher doc), never a labelled positive or the stored negative.
+    n_neg = 1 is just the stored negatives (no scoring)."""
+    out = np.array(neg)[:, None]
+    if n_neg == 1:
+        return out
+    mined = []
+    for start in range(0, len(neg), chunk):
+        scores = teacher_q[start:start + chunk].to(docs.device) @ docs.T
+        for r in range(len(scores)):
+            scores[r, pos[start + r]] = float("-inf")
+            scores[r, neg[start + r]] = float("-inf")
+        mined.append(scores.topk(n_neg - 1, dim=1).indices.cpu().numpy())
+    return np.concatenate([out, np.concatenate(mined)], 1)
+
+
 def refine_main(rank, world_size, cfg):
     """One worker of ddp.launch(refine_main, cfg). Resumes from the latest step checkpoint; no-op if final/ exists."""
     cfg = resolve_cfg(REFINE_DEFAULTS, cfg)
@@ -92,15 +111,17 @@ def train(rank, world_size, cfg, device):
     lora, head = adapter_params(model)
     for p in lora + head:
         p.requires_grad_(True)
-    batch_loss = functools.partial(_refine_batch_loss, tokenizer=tokenizer, queries=queries,
-                                   docs=torch.from_numpy(docs).to(device), teacher_q=teacher_q, cfg=cfg, device=device)
+    docs = torch.from_numpy(docs).to(device)
+    neg = mine_negatives(teacher_q, docs.float(), queries["pos"], queries["neg"], cfg["n_neg"])  # same on every rank
+    batch_loss = functools.partial(_refine_batch_loss, tokenizer=tokenizer, queries=queries, neg=neg,
+                                   docs=docs, teacher_q=teacher_q, cfg=cfg, device=device)
     run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, len(queries["ids"]), batch_loss, data, "refine")
 
 
-def _refine_batch_loss(model, global_idx, local, epoch, tokenizer, queries, docs, teacher_q, cfg, device):
+def _refine_batch_loss(model, global_idx, local, epoch, tokenizer, queries, neg, docs, teacher_q, cfg, device):
     # docs of the whole global batch: positives (one per query, rotating over its positives by epoch), then negatives
     pos = [queries["pos"][i][epoch % len(queries["pos"][i])] for i in global_idx]
-    cols = np.array(pos + [queries["neg"][i] for i in global_idx])
+    cols = np.concatenate([pos, neg[global_idx].ravel()])
     idx = global_idx[local]
     known_pos = torch.from_numpy(np.stack([np.isin(cols, queries["pos"][i]) for i in idx])).to(device)
     pos_col = torch.arange(len(global_idx), device=device)[local]

@@ -13,7 +13,7 @@ from data import build_data, save_json
 from ddp import launch
 from evaluation import evaluate_model, load_index
 from model import ADAPTER_WEIGHTS, attach_adapter, load_encoder, save_adapter
-from refine import contrastive_loss, refine_main
+from refine import contrastive_loss, mine_negatives, refine_main
 
 DEVICE = torch.device("cpu")
 DIM = 32
@@ -46,6 +46,15 @@ def test_contrastive_loss_masks_negatives_above_margin():
     loss, masked = contrastive_loss(q, near_dup, pos_col, torch.zeros(1, 3, dtype=torch.bool), 0.05, margin=0.1)
     without, _ = contrastive_loss(q, docs, pos_col, torch.zeros(1, 2, dtype=torch.bool), 0.05, margin=0.1)
     assert loss.item() == pytest.approx(without.item(), abs=1e-6) and masked.item() == pytest.approx(1 / 2)
+
+
+def test_mine_negatives():
+    docs = torch.eye(5)
+    teacher_q = torch.tensor([[0., 1, 2, 3, 4], [4., 3, 2, 1, 0]])  # q0 ranks docs 4,3,2,1,0; q1 ranks 0,1,2,3,4
+    pos, neg = [[4], [0]], [1, 3]
+    assert mine_negatives(teacher_q, docs, pos, neg, 1).tolist() == [[1], [3]]  # n_neg=1: only the stored negative
+    got = mine_negatives(teacher_q, docs, pos, neg, 3, chunk=1)
+    assert got.tolist() == [[1, 3, 2], [3, 1, 2]]  # stored first; mined skip positives and the stored negative
 
 
 @pytest.fixture(scope="module")
@@ -81,3 +90,12 @@ def test_refine_trains_from_adapter(run):
     docs, _ = load_index(data, emb_dir, ("val",))
     result = evaluate_model(os.path.join(cfg["out_dir"], "final"), data, docs, ("val",), DIM, dtype="fp32")
     assert 0 <= result["val"]["ndcg@10"] <= 1
+
+
+def test_refine_with_mined_negatives(run):
+    _, _, cfg, _ = run
+    cfg = {**cfg, "n_neg": 3, "epochs": 1, "eval_every": 0, "out_dir": cfg["out_dir"] + "_mined"}
+    launch(refine_main, cfg, nprocs=2)
+    train = [r for r in read_log(cfg["out_dir"]) if "train_loss" in r]
+    assert len(train) == 1 and all(map(math.isfinite, (train[0]["cr"], train[0]["l2"])))
+    assert os.path.exists(os.path.join(cfg["out_dir"], "final"))

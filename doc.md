@@ -141,10 +141,10 @@ Phase 3: open `notebooks/phase_3_refine.ipynb` with the same `DEBUG` value (GPU 
 | 3 · Training log | `loss`, `cr` (contrastive), `l2`, `masked` (fraction of negatives masked), val rows. |
 | 4 · Evaluate | `evaluate_model(OUT_DIR/final, ...)` → row `refined_tau<τ>_l2w<λ>` in the shared `metrics.json`, then `summarize`. |
 
-Phase-3 loss, per GPU (B queries) with the global batch's docs (positive + stored `negative[0]` of every query in
+Phase-3 loss, per GPU (B queries) with the global batch's docs (positive + `n_neg` negatives of every query in
 it, all ranks; the docs are frozen teacher vectors, so no gather is needed):
 ```
-logits_i = [ s(q_i, d_j) for all 2·B·world docs ] ++ [ s(q_i, q_j) for the B queries on this GPU ]   / tau
+logits_i = [ s(q_i, d_j) for all (1+n_neg)·B·world docs ] ++ [ s(q_i, q_j) for the B queries on this GPU ]   / tau
 masked   = q_i's other labelled positives, q_i itself, and any negative with s > s(q_i, d_i+) + margin
 L        = CE(logits, own positive) + l2_weight · ||q_i − teacher(q_i)||²
 ```
@@ -228,6 +228,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | Function | What it does |
 |---|---|
 | `refine_main(rank, world_size, cfg)` | Worker for `launch(refine_main, REFINE)`. Loads `init_adapter` (base + adapter), unfreezes the adapter, trains the train split with `align.run`. Writes only to `out_dir`. |
+| `mine_negatives(teacher_q, docs, pos, neg, n_neg, chunk=256)` | `[N, n_neg]` negative corpus rows per query: stored negative first, then the top teacher-scored docs excluding positives and the stored one. `n_neg=1` skips scoring. |
 | `contrastive_loss(q, docs, pos_col, known_pos, tau, margin)` | L_CR with doc + same-tower query negatives and false-negative masking; returns `(loss, masked fraction)`. |
 
 ### `ddp.py`
@@ -277,8 +278,9 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `init_adapter` | `"runs/align/final"` | Phase-2 adapter dir; read only. LoRA shape and dropout come from its config. |
 | `dim`, `query_prefix`, `max_query_len` | `256`, `""`, `32` | Must match phase 2 / the teacher index. |
 | `tau`, `margin`, `l2_weight` | `0.05`, `0.1`, `0.1` | Temperature; false-negative margin; λ of the L2 term (0 = pure L_CR). |
+| `n_neg` | `1` | Negatives per query. `1` = the stored `negative[0]` only (no mining); `k > 1` adds the `k-1` corpus docs the teacher scores highest for the query (never a labelled positive), mined once at start. |
 | `lr`, `head_lr`, `weight_decay`, `warmup_ratio` | `5e-5`, `1e-4`, `0.0`, `0.05` | AdamW; warmup then cosine to 0. |
-| `epochs`, `batch_size`, `grad_clip`, `amp`, `seed` | `1`, `64`, `1.0`, `True`, `0` | `batch_size` = queries per GPU (docs per step = 2 · batch_size · world_size). |
+| `epochs`, `batch_size`, `grad_clip`, `amp`, `seed` | `1`, `64`, `1.0`, `True`, `0` | `batch_size` = queries per GPU (docs per step = (1 + n_neg) · batch_size · world_size). |
 | `log_every`, `eval_every`, `save_every`, `keep_last` | `20`, `200`, `500`, `2` | Steps. Debug: `5 / 20 / 20`. |
 | `data_path`, `teacher_emb_dir`, `out_dir` | `cache/data.json`, `cache/emb/teacher`, `runs/refine` | The notebook sets them under `{debug,full}`. |
 
@@ -301,6 +303,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_l2_loss_is_two_minus_two_cos` | Loss scale. |
 | `test_align_trains_and_keeps_last_checkpoints`, `test_align_resumes_from_latest_checkpoint` | 2-process alignment: loss goes down, `keep_last`, final adapter evaluates; a re-run resumes mid-run instead of restarting. |
 | `test_contrastive_loss_by_hand`, `test_contrastive_loss_masks_negatives_above_margin` | L_CR formula, known-positive masking, margin masking (a masked doc = an absent doc). |
+| `test_mine_negatives`, `test_refine_with_mined_negatives` | Mined negatives skip positives and the stored negative (`n_neg=1` = stored only); a 2-process run with `n_neg=3` trains and saves. |
 | `test_refine_trains_from_adapter` | 2-process refinement from a saved adapter: contrastive loss goes down, val rows logged, the init adapter untouched, final adapter evaluates. |
 | `test_expected_notebooks`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
 
