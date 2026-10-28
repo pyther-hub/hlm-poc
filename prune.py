@@ -104,3 +104,4 @@ def train(rank, world_size, cfg, device):
                                    targets=torch.from_numpy(targets.astype(np.float32)), loss_fn=l2_loss, cfg=cfg,
                                    device=device)
     run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, len(texts), batch_loss, data, "prune")
+       

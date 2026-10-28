@@ -6,7 +6,9 @@ import nbformat
 import pytest
 
 NB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks")
-NOTEBOOKS = ["experiments.ipynb", "phase_1_eval.ipynb", "phase_1_teacher.ipynb", "phase_2_align.ipynb", "phase_3_refine.ipynb"]
+NOTEBOOKS = ["00_data_audit_and_retrieval_baseline.ipynb", "01_generate_teacher_embeddings.ipynb",
+             "02_student_alignment_and_pruning.ipynb", "03_contrastive_refinement.ipynb",
+             "04_retrieval_evaluation_and_ablation.ipynb"]
 
 
 def strip_magics(src):

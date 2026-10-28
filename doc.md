@@ -6,8 +6,8 @@ the query side changes.
 
 **Current scope.** Phase 1: build the MS MARCO data, embed it with the teacher on 2 GPUs, and evaluate retrieval on
 val/test against that index. Phase 2: alignment fine-tuning of the student (LoRA r=16 + linear head, DDP) onto the
-teacher's query vectors. Phase 3: contrastive refinement of that adapter against the frozen teacher document vectors. Experiments (`run_exp.py`, `experiments.ipynb`): alignment loss, one-shot CL, progressive vs direct pruning (full
-fine-tune, `prune.py`), before/after CR, latency and cos(q, d+). Everything runs on Kaggle (GPU T4 x2). This repo holds
+teacher's query vectors. Phase 3: contrastive refinement of that adapter against the frozen teacher document vectors. Pruning 28→14→7 with full fine-tune (`prune.py`), before/after CR, latency and cos(q, d+) (`run_exp.py`).
+Notebooks `00`–`04` (§1). Everything runs on Kaggle (GPU T4 x2). This repo holds
 the flat, tested functions the notebooks import: plain functions, no classes, no global state, no config system.
 
 ---
@@ -16,7 +16,7 @@ the flat, tested functions the notebooks import: plain functions, no classes, no
 
 ### 0.1 Modules
 ```
- phase_1_teacher.ipynb         phase_1_eval.ipynb         phase_2_align.ipynb     phase_3_refine.ipynb
+ 00, 01 (data, teacher)        00, 02, 04 (eval)          02 (align)              03 (refine)
       │            │                    │                          │                       │
  ┌────▼─────┐ ┌────▼───────┐    ┌───────▼────────┐          ┌──────▼──────┐         ┌──────▼──────┐
  │ data.py  │ │ teacher.py │    │ evaluation.py  │◀─────────│  align.py   │◀────────│  refine.py  │
@@ -46,14 +46,17 @@ build_data ─▶ data.json
    ▼
 embed_main (2 GPUs, shard per rank) ─▶ emb/teacher/{corpus,align,val,test}.npy  fp16 [N, 256] + *_ids.json
    ▼
-phase_1_eval (1 GPU): queries (cached teacher vectors, or any model) → top-100 over the teacher corpus
-   ─▶ runs/<mode>/eval/metrics.json   {row name: {split: metrics}}
+evaluation (1 GPU): queries (cached teacher vectors, or any model) → top-100 over the teacher corpus
+   ─▶ runs/<mode>/metrics.json   {row name: {split: metrics}}
    ▼
 align_main (2 GPUs, DDP): student(align query) ≈ teacher align.npy, adapter only
-   ─▶ runs/<mode>/align/{step_<n>, final}/ adapter.pt + adapter_config.json, log.jsonl
+   ─▶ runs/<mode>/aligned/{step_<n>, final}/ adapter.pt + adapter_config.json, log.jsonl
    ▼
-refine_main (2 GPUs, DDP): from align/final; L_CR over train queries vs teacher corpus.npy + λ·L2 to teacher q
-   ─▶ runs/<mode>/refine/{step_<n>, final}/, log.jsonl
+prune_main (2 GPUs, DDP): aligned → prog_l14 → prog_l7, cut layers, full fine-tune, same L2
+   ─▶ runs/<mode>/prog_l<n>/{step_<n>, final}/ (whole state dict, full: true)
+   ▼
+refine_main (2 GPUs, DDP): from each of the above; L_CR over train queries vs teacher corpus.npy + λ·L2 to teacher q
+   ─▶ runs/<mode>/<student>_cr/{step_<n>, final}/, log.jsonl
 ```
 
 Adapter (`model.attach_adapter`, plain parameters + forward hooks, no wrapper classes):
@@ -93,54 +96,31 @@ notebook ── launch(embed_main, TEACHER) ──▶ mp.spawn ─┬─ rank 0 
 ---
 
 ## 1. Using it on Kaggle
-Notebook settings: **Accelerator → GPU T4 x2**, **Internet ON**. Open `notebooks/phase_1_teacher.ipynb`. Its first
-cell clones the repo (`git pull` on later runs), upgrades `transformers` if it is older than 4.56 (restart the
-kernel once if it says so) and installs `datasets`, `pyarrow`, `accelerate` if missing.
+Five notebooks, one Kaggle session each, run in order. Notebook settings: **Accelerator → GPU T4 x2**, **Internet ON**.
+Cell 1 clones the repo (`git pull` on later runs), upgrades `transformers` if older than 4.56 (restart the kernel once
+if it says so) and installs `datasets`, `pyarrow`, `accelerate` if missing. Cell 2 is the control panel. Run everything
+with `DEBUG = True` first, then `DEBUG = False`; use the same value in all five.
 
-Run with `DEBUG = True` first and check that the last cell shows norms ≈ 1.0 and `ids match: True`. Then set
-`DEBUG = False`.
+**Chaining.** Each notebook writes under `/kaggle/working` (`cache/<mode>/...`, `runs/<mode>/...`). Save the version,
+then attach it as an input to the next notebook and set that notebook's `IN_<nn>` slug in the control panel
+(`KAGGLE_IN = /kaggle/input/notebooks/tensorpanda231`). Big files (vectors, checkpoints) are read from the input in
+place; the small `runs/<mode>/metrics.json` is copied forward once, so rows accumulate and are never re-evaluated.
+Off Kaggle every `IN_*` is the repo dir.
+```
+00 ─ data.json, metrics(base_student_own_index) ─▶ 01 ─ data.json, emb/teacher/*.npy, metrics(+teacher)
+   ─▶ 02 ─ aligned/, prog_l14/, prog_l7/ ─▶ 03 ─ <student>_cr/ ─▶ 04 (reads 01, 02, 03)
+```
 
-| Cell | What it does |
-|---|---|
-| Control panel | `DEBUG`, `NPROCS`, paths, `DATA`, `TEACHER`, `CHECKS`. |
-| 1 · Build data | Stream rows → `build_data` → `data.json` (reused if it already exists). |
-| 2 · Pre-flight | `fp16_sanity` (asserts no NaNs) + `time_embedding` (prints projected hours vs `budget_h`). Skipped once `corpus.npy` exists. |
-| 3 · Embed | `launch(embed_main, TEACHER, nprocs=2)`. |
-| 4 · Inspect | Shape, dtype, norm min/max, file size, and an ids check for every set. |
+| Notebook | GPUs | Cells |
+|---|---|---|
+| `00_data_audit_and_retrieval_baseline` | 2 | Build `data.json` (`load_rows` → `build_data`) · audit (sample triples, positives per query, token lengths) · leakage asserts (splits disjoint by id, align has no val/test query by id or text; shared positives only reported) · baseline: `launch(embed_main, ...)` with the untrained 0.6B at d=1024 into `emb/student_base`, `score` on its own index → row `base_student_own_index`. |
+| `01_generate_teacher_embeddings` | 2 | Teacher **inference** (no training). Copy `data.json` from 00 · `fp16_sanity` + `time_embedding` · `launch(embed_main, TEACHER)` (resumable shards) · validate shape / finite / norms / ids per set · `teacher_ceiling` → row `teacher`. |
+| `02_student_alignment_and_pruning` | 2 | `train_once(align_main, ALIGN)` → `aligned` (LoRA + head, L2) · for n in `STAGES` (14, 7): `train_once(prune_main, ...)` from the previous stage → `prog_l<n>` (full fine-tune, L2, `ffn_keep=1.0`) · curves · `evaluate_runs` + `print_rows` · `measure_latency` per stage. |
+| `03_contrastive_refinement` | 2 | Show train triples · `exp_cr(REFINE, STUDENTS, ...)`: `refine_main` from each of `aligned`, `prog_l14`, `prog_l7` → `<student>_cr`, gains vs the pre-refinement row, bars + curves. |
+| `04_retrieval_evaluation_and_ablation` | 1 | `evaluate_runs` fills missing rows · `summarize` val/test · `exp_latency` (teacher first: params, fp16 MB, ms/query, q/s, speedup, cos(q, d+)) · ablation table (alignment, each prune cut, each refinement; ndcg@10 and recall@100) + bars. |
 
-Sessions are capped at 9 h. Every step is resumable: rows are cached as parquet, `data.json` is reused, and
-teacher shards that already exist are skipped.
-
-Then open `notebooks/phase_1_eval.ipynb` with the same `DEBUG` value. It reads the cache built above and needs one GPU.
-
-| Cell | What it does |
-|---|---|
-| Control panel | `DEBUG`, paths, `EVAL` (splits, k, dim, batch size), `MRL_DIMS`, `MODELS` (name → hub id or checkpoint dir + query prefix/length/dtype), `LATENCY` (same entry shape; the teacher entry and `EVAL["dim"]` are read from `TEACHER_DEFAULTS`). |
-| 1 · Load and check | `load_index`: asserts finite, unit-norm vectors, ids in `data.json` order, every positive a valid corpus row. |
-| 2 · Teacher ceiling | Row `teacher` (cached teacher queries vs corpus) + `teacher@d64`, `teacher@d128` (MRL sweep). |
-| 3 · Models | `evaluate_model` per `MODELS` entry. The untrained student is expected near zero (different embedding space). |
-| 4 · Summary | One table per split, teacher first, retention = nDCG@10 / teacher nDCG@10. |
-| 5 · Latency | ms/query and queries/s per batch size, teacher (with its prompt) vs student. |
-
-Phase 2: open `notebooks/phase_2_align.ipynb` with the same `DEBUG` value (GPU T4 x2).
-
-| Cell | What it does |
-|---|---|
-| Control panel | `DEBUG`, `NPROCS`, paths, `ALIGN` (all of `ALIGN_DEFAULTS`, §4.4; `dim` read from `TEACHER_DEFAULTS`). |
-| 1 · Check inputs | `check_emb` on the teacher's `align`, `val`, `corpus` vectors; the loss name exists; planned steps. |
-| 2 · Train | `launch(align_main, ALIGN, nprocs=NPROCS)`. Resumes from the latest `step_<n>/`; no-op once `final/` exists. |
-| 3 · Training log | Train loss and the in-training val rows (val loss, val cos, nDCG@10, Recall@10) from `log.jsonl`. |
-| 4 · Evaluate | `evaluate_model(OUT_DIR/final, ...)` on val/test → row `aligned_r<rank>_<loss>` in `runs/<mode>/eval/metrics.json`, then `summarize`. |
-
-Phase 3: open `notebooks/phase_3_refine.ipynb` with the same `DEBUG` value (GPU T4 x2), after phase 2 wrote `align/final`.
-
-| Cell | What it does |
-|---|---|
-| Control panel | `DEBUG`, `NPROCS`, paths (`INIT_ADAPTER` = `runs/<mode>/align/final`), `REFINE` (all of `REFINE_DEFAULTS`, §4.5). |
-| 1 · Check inputs | Adapter config matches `dim`; `check_emb` on `corpus`, `align`, `val`; every train query has a teacher vector. |
-| 2 · Train | `launch(refine_main, REFINE, nprocs=NPROCS)`. Resumable, no-op once `final/` exists. |
-| 3 · Training log | `loss`, `cr` (contrastive), `l2`, `masked` (fraction of negatives masked), val rows. |
-| 4 · Evaluate | `evaluate_model(OUT_DIR/final, ...)` → row `refined_tau<τ>_l2w<λ>` in the shared `metrics.json`, then `summarize`. |
+Sessions are capped at 9 h. Every training / embedding step is resumable (`step_<n>/` checkpoints, existing shards
+skipped) and a finished stage (`final/` exists) is skipped.
 
 Phase-3 loss, per GPU (B queries) with the global batch's docs (positive + `n_neg` negatives of every query in
 it, all ranks; the docs are frozen teacher vectors, so no gather is needed):
@@ -154,18 +134,9 @@ L        = CE(logits, own positive) + l2_weight · ||q_i − teacher(q_i)||²
 vectors) and are picked in the control panel with `loss` / `loss_kwargs`. They can't be defined in a notebook cell:
 the DDP workers are spawned processes and only receive importable functions.
 
-### `experiments.ipynb`
-| Cell | What it does |
-|---|---|
-| Control panel | `DEBUG`, `NPROCS`, `EXP`, inputs (`DATA_PATH`, `EMB_DIR`, `ALIGNED` = phase-2 adapter; on Kaggle under `/kaggle/input/notebooks/tensorpanda231/...`), `EXP_DIR`, `RESUME_FROM`, `ALIGN` + `LOSS_ARMS`, `REFINE`, `PRUNE` + `PRUNE_STAGES` / `PRUNE_DIRECT`, `CR_STUDENTS`, `LATENCY_MODELS` + `LATENCY`, `EVAL`. |
-| 1 · Check inputs | Copies `RESUME_FROM` into `EXP_DIR` once; `load_index`; the phase-2 adapter matches `dim`. |
-| 2 · Run `EXP` | The `run_exp.exp_*` function: trains missing arms, evaluates missing rows, prints the table, shows the plots. |
-| 3 · All rows | `summarize(EXP_DIR, split)` over every experiment's rows. |
-| 4 · Saved adapters | Each `EXP_DIR/<arm>/final` with its size, and the plot files. |
-
-Rows / arms: `align_l2`, `align_kl` (losses); `aligned` (input), `aligned_cr`, `oneshot` (oneshot); `prog_l<n>`,
-`direct_l<n>` (prune); `<student>_cr` (cr). "P@100" is reported as `recall@100`. The one-shot arm is a proxy:
-the teacher (doc tower) stays frozen, unlike the paper's jointly trained baseline.
+Rows: `base_student_own_index` (00), `teacher` (01), `aligned`, `prog_l14`, `prog_l7` (02), `<student>_cr` (03).
+"P@100" is reported as `recall@100` (~1 positive per query, so precision@100 ≤ 0.01). `run_exp.py` also keeps
+`exp_losses`, `exp_oneshot` and direct pruning (`exp_prune`), which no notebook calls now.
 
 **Pruning** (`prune.py`): from an adapter dir, LoRA merged into the base (`merge_lora`) or a previous pruned stage;
 keep `n_layers` evenly spaced layers (first and last always) and `ffn_keep` of each kept layer's FFN neurons, by
@@ -181,7 +152,7 @@ full MS MARCO (8.8M), so absolute scores are higher than published ones. Use the
 ```bash
 .venv/bin/python -m pytest -q        # CPU, offline, < 30 s
 ```
-The notebook is edited by hand. Commit it without outputs (a test enforces this).
+Notebooks are edited by hand. Commit them without outputs (a test enforces this).
 
 ---
 
@@ -367,9 +338,6 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 
 ## 6. Workflow
 1. Edit locally → `.venv/bin/python -m pytest -q` → commit → push.
-2. On Kaggle: re-run the setup cell, run with `DEBUG = True`, then `DEBUG = False`.
-3. After the teacher index exists: run `phase_1_eval` with the same `DEBUG` value.
-4. Then `phase_2_align` (same `DEBUG`); its final adapter is scored into the same `metrics.json`.
-5. Then `phase_3_refine` (same `DEBUG`), which starts from `align/final`; its row lands in the same table.
-6. Then `experiments`, one `EXP` per session (`losses`, `oneshot`, `prune`, then `cr` and `latency`, which reuse the
-   pruned arms). Save the version and set `RESUME_FROM` to its output in the next session.
+2. On Kaggle run `00` → `01` → `02` → `03` → `04`, each with `DEBUG = True`; after each, *Save Version* and attach it
+   as an input to the next (set `IN_<nn>`).
+3. Repeat with `DEBUG = False`.

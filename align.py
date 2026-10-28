@@ -89,11 +89,16 @@ def align_main(rank, world_size, cfg):
 def train(rank, world_size, cfg, device):
     data = load_json(cfg["data_path"])
     texts = data["align"]["texts"]
+    #targets [N, d] teacher vectors for the align queries.
+    #ids [N] query ids for the align queries, must match data["align"]["ids"].
     targets, ids = load_emb(cfg["teacher_emb_dir"], "align")
     assert ids == data["align"]["ids"], "align: teacher vectors don't match data.json"
     assert targets.shape[1] == cfg["dim"], f"teacher dim {targets.shape[1]} != cfg dim {cfg['dim']}"
+
+    #convert the targets to a torch tensor of type float32 for training
     targets = torch.from_numpy(targets.astype(np.float32))
 
+    
     model, tokenizer = load_rank0_first(cfg["model"], device)
     torch.manual_seed(cfg["seed"])  # same adapter init on every rank (DDP also broadcasts it from rank 0)
     attach_adapter(model, cfg["lora_rank"], cfg["lora_alpha"], cfg["lora_dropout"], cfg["lora_targets"], cfg["dim"])
