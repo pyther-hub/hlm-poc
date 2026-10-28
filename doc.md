@@ -6,7 +6,8 @@ the query side changes.
 
 **Current scope.** Phase 1: build the MS MARCO data, embed it with the teacher on 2 GPUs, and evaluate retrieval on
 val/test against that index. Phase 2: alignment fine-tuning of the student (LoRA r=16 + linear head, DDP) onto the
-teacher's query vectors. Phase 3: contrastive refinement of that adapter against the frozen teacher document vectors. Experiments run on Kaggle (GPU T4 x2). This repo holds
+teacher's query vectors. Phase 3: contrastive refinement of that adapter against the frozen teacher document vectors. Experiments (`run_exp.py`, `experiments.ipynb`): alignment loss, one-shot CL, progressive vs direct pruning (full
+fine-tune, `prune.py`), before/after CR, latency and cos(q, d+). Everything runs on Kaggle (GPU T4 x2). This repo holds
 the flat, tested functions the notebooks import: plain functions, no classes, no global state, no config system.
 
 ---
@@ -153,6 +154,26 @@ L        = CE(logits, own positive) + l2_weight · ||q_i − teacher(q_i)||²
 vectors) and are picked in the control panel with `loss` / `loss_kwargs`. They can't be defined in a notebook cell:
 the DDP workers are spawned processes and only receive importable functions.
 
+### `experiments.ipynb`
+| Cell | What it does |
+|---|---|
+| Control panel | `DEBUG`, `NPROCS`, `EXP`, inputs (`DATA_PATH`, `EMB_DIR`, `ALIGNED` = phase-2 adapter; on Kaggle under `/kaggle/input/notebooks/tensorpanda231/...`), `EXP_DIR`, `RESUME_FROM`, `ALIGN` + `LOSS_ARMS`, `REFINE`, `PRUNE` + `PRUNE_STAGES` / `PRUNE_DIRECT`, `CR_STUDENTS`, `LATENCY_MODELS` + `LATENCY`, `EVAL`. |
+| 1 · Check inputs | Copies `RESUME_FROM` into `EXP_DIR` once; `load_index`; the phase-2 adapter matches `dim`. |
+| 2 · Run `EXP` | The `run_exp.exp_*` function: trains missing arms, evaluates missing rows, prints the table, shows the plots. |
+| 3 · All rows | `summarize(EXP_DIR, split)` over every experiment's rows. |
+| 4 · Saved adapters | Each `EXP_DIR/<arm>/final` with its size, and the plot files. |
+
+Rows / arms: `align_l2`, `align_kl` (losses); `aligned` (input), `aligned_cr`, `oneshot` (oneshot); `prog_l<n>`,
+`direct_l<n>` (prune); `<student>_cr` (cr). "P@100" is reported as `recall@100`. The one-shot arm is a proxy:
+the teacher (doc tower) stays frozen, unlike the paper's jointly trained baseline.
+
+**Pruning** (`prune.py`): from an adapter dir, LoRA merged into the base (`merge_lora`) or a previous pruned stage;
+keep `n_layers` evenly spaced layers (first and last always) and `ffn_keep` of each kept layer's FFN neurons, by
+`|gate_j|·|up_j|·|down_:,j|`; then train **every weight** + head with L2 on the align set (`align.run`). The
+checkpoint is an adapter dir with `full: true`, `keep_layers`, `ffn_idx` (indices into the hub base) and the whole
+state dict in `adapter.pt`; `load_encoder` rebuilds it from the base id. Progressive = chained stages; direct = one
+cut with `ffn_keep ** stages` so the final shape matches.
+
 **Corpus caveat:** the index is only the positives + one stored negative of the core queries (~200k passages), not
 full MS MARCO (8.8M), so absolute scores are higher than published ones. Use them to compare models.
 
@@ -211,9 +232,13 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | Function | What it does |
 |---|---|
 | `attach_adapter(model, rank, alpha, dropout, targets, out_dim)` | LoRA (A Kaiming, B zero) on every `nn.Linear` named in `targets` + `align_head` Linear(hidden → out_dim) after the final norm. Hooks, no wrapper modules. |
+| `attach_head(model, out_dim)` | Just the `align_head` (used by `attach_adapter` and by fully trained models). |
 | `adapter_params(model)` | `(lora params, head params)`. |
-| `save_adapter(model, path, adapter_cfg, trainer_state=None)` | Dir with `adapter.pt` (adapter weights only), `adapter_config.json` (`base, rank, alpha, dropout, targets, out_dim`), optional `trainer_state.pt`. Written to `path.tmp`, then swapped in. |
-| `load_adapter(path, device, dtype)` / `load_encoder(path, ...)` | Base from the config + adapter weights; frozen, eval. `load_encoder` dispatches to it when `path` holds `adapter_config.json`. |
+| `trainable_params(model)` | `(body, head)` among `requires_grad` params; body = LoRA for a frozen base, every weight for a full model. `align.run`'s optimizer groups. |
+| `merge_lora(model, path)` | Fold an adapter dir's LoRA into the base weights (`W += α/r · B A`) and attach its head; no hooks. |
+| `prune_model(model, keep_layers, ffn_idx)` | In place: keep those decoder layers and, per kept layer, those FFN neurons (gate/up rows, down columns); updates `num_hidden_layers`, `intermediate_size`, `layer_types`. |
+| `save_adapter(model, path, adapter_cfg, trainer_state=None)` | Dir with `adapter.pt` (adapter weights only, or the whole state dict if `adapter_cfg["full"]`), `adapter_config.json` (`base, rank, alpha, dropout, targets, out_dim`, or `base, out_dim, full, keep_layers, ffn_idx`), optional `trainer_state.pt`. Written to `path.tmp`, then swapped in. |
+| `load_adapter(path, device, dtype)` / `load_encoder(path, ...)` | Base from the config (pruned if `keep_layers`), then LoRA + head or, if `full`, head only, then the saved weights; frozen, eval. `load_encoder` dispatches to it when `path` holds `adapter_config.json`. |
 
 ### `align.py`
 | Function | What it does |
@@ -227,7 +252,25 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 ### `refine.py`
 | Function | What it does |
 |---|---|
-| `refine_main(rank, world_size, cfg)` | Worker for `launch(refine_main, REFINE)`. Loads `init_adapter` (base + adapter), unfreezes the adapter, trains the train split with `align.run`. Writes only to `out_dir`. |
+| `refine_main(rank, world_size, cfg)` | Worker for `launch(refine_main, REFINE)`. Loads `init_adapter` (base + adapter), unfreezes the adapter (every weight for a `full` pruned init), trains the train split with `align.run`. Writes only to `out_dir`. |
+
+### `prune.py`
+| Function | What it does |
+|---|---|
+| `prune_main(rank, world_size, cfg)` | Worker for `launch(prune_main, PRUNE)`. `pruned_student`, unfreeze everything, L2 on the align set with `align.run`. Defaults in `PRUNE_DEFAULTS` (§4.6). |
+| `pruned_student(init, n_layers, ffn_keep, device)` | `(model, tokenizer, adapter_cfg)`: init adapter merged (LoRA) or loaded (pruned stage), cut, with indices relative to the hub base. |
+| `select_layers(n, k)`, `ffn_scores(mlp)`, `top_neurons(mlp, k)` | Evenly spaced layers (first, last kept); per-neuron `|gate_j|·|up_j|·|down_:,j|`; the top k, sorted. |
+
+### `run_exp.py`
+| Function | What it does |
+|---|---|
+| `exp_losses(align_cfg, losses, data, index, exp_dir, ev, nprocs)` | Phase 2 per arm `{arm: (loss, kwargs)}`; curves + bars + table. |
+| `exp_oneshot(align_cfg, refine_cfg, aligned, data, index, exp_dir, ev, nprocs)` | Fresh adapter → `refine_main` with `l2_weight=0` for ≈ align + CR steps, vs `aligned` and `aligned_cr`. |
+| `exp_prune(prune_cfg, aligned, stages, direct, data, index, exp_dir, ev, nprocs)` | Progressive `prog_l<n>` chain and direct `direct_l<n>`; metric vs layers plot. |
+| `exp_cr(refine_cfg, students, data, index, exp_dir, ev, nprocs)` | `<student>_cr` per student; gains printed, bars + curves. |
+| `exp_latency(models, data, index, exp_dir, device, dim, n_queries, batch_sizes)` | `measure_latency` per model (first = reference) → `latency.json`, speedups; mean cos(q, d+) on val; plot. |
+| `kl_loss(student, teacher, tau)`, `exp_align_main` | KaLM-style KL over the batch's teacher vectors; `align_main` with `"kl"` registered in the worker (L2 stays the default elsewhere). |
+| `train_once`, `evaluate_runs`, `cos_to_positive`, `plot_curves`, `plot_bars`, `print_rows`, `save_fig` | Skip finished arms / rows (+ the teacher row); helpers. |
 | `mine_negatives(teacher_q, docs, pos, neg, n_neg, chunk=256)` | `[N, n_neg]` negative corpus rows per query: stored negative first, then the top teacher-scored docs excluding positives and the stored one. `n_neg=1` skips scoring. |
 | `contrastive_loss(q, docs, pos_col, known_pos, tau, margin)` | L_CR with doc + same-tower query negatives and false-negative masking; returns `(loss, masked fraction)`. |
 
@@ -284,6 +327,17 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `log_every`, `eval_every`, `save_every`, `keep_last` | `20`, `200`, `500`, `2` | Steps. Debug: `5 / 20 / 20`. |
 | `data_path`, `teacher_emb_dir`, `out_dir` | `cache/data.json`, `cache/emb/teacher`, `runs/refine` | The notebook sets them under `{debug,full}`. |
 
+### 4.6 `PRUNE` (`prune.PRUNE_DEFAULTS`)
+| Key | Default | Meaning |
+|---|---|---|
+| `init` | `"runs/align/final"` | Phase-2 adapter or a previous pruned stage; read only. |
+| `n_layers`, `ffn_keep` | `14`, `0.75` | Layers kept (evenly spaced over the init's); fraction of the init's FFN width kept. |
+| `dim`, `query_prefix`, `max_query_len` | `256`, `""`, `32` | Must match phase 2 / the teacher index. |
+| `lr`, `head_lr`, `weight_decay`, `warmup_ratio` | `2e-5`, `1e-4`, `0.0`, `0.05` | AdamW over every weight / the head; warmup then cosine to 0. |
+| `epochs`, `batch_size`, `grad_clip`, `amp`, `seed` | `1`, `64`, `1.0`, `True`, `0` | `batch_size` per GPU. |
+| `log_every`, `eval_every`, `save_every`, `keep_last` | `20`, `200`, `500`, `2` | Steps. Debug: `5 / 20 / 20`. |
+| `data_path`, `teacher_emb_dir`, `out_dir` | `cache/data.json`, `cache/emb/teacher`, `runs/prune` | Set per arm by `run_exp.exp_prune`. |
+
 ---
 
 ## 5. Tests (`tests/`, CPU, offline, < 30 s)
@@ -305,6 +359,10 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_contrastive_loss_by_hand`, `test_contrastive_loss_masks_negatives_above_margin` | L_CR formula, known-positive masking, margin masking (a masked doc = an absent doc). |
 | `test_mine_negatives`, `test_refine_with_mined_negatives` | Mined negatives skip positives and the stored negative (`n_neg=1` = stored only); a 2-process run with `n_neg=3` trains and saves. |
 | `test_refine_trains_from_adapter` | 2-process refinement from a saved adapter: contrastive loss goes down, val rows logged, the init adapter untouched, final adapter evaluates. |
+| `test_select_layers`, `test_prune_keep_all_is_identity`, `test_ffn_pruning_drops_dead_neurons` | Layer choice; surgery that changes outputs when it shouldn't; neuron scores / slicing. |
+| `test_merge_lora_matches_hooks`, `test_pruned_checkpoint_roundtrip_and_chain`, `test_full_model_trains_every_weight` | Merged LoRA ≠ hooked LoRA; full checkpoints not reloading; progressive indices not relative to the base; frozen weights in a full fine-tune. |
+| `test_prune_main_trains_pruned_student`, `test_refine_trains_pruned_student` | 2-process pruning trains and saves a 1-layer full checkpoint; CR on it trains. |
+| `test_kl_loss_zero_iff_same`, `test_lora_trainable_params_match_adapter_params`, `test_evaluate_runs_adds_teacher_and_resumes` | KL scale; LoRA optimizer groups changed (breaks resume); finished rows re-evaluated; plots. |
 | `test_expected_notebooks`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
 
 ## 6. Workflow
@@ -313,3 +371,5 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 3. After the teacher index exists: run `phase_1_eval` with the same `DEBUG` value.
 4. Then `phase_2_align` (same `DEBUG`); its final adapter is scored into the same `metrics.json`.
 5. Then `phase_3_refine` (same `DEBUG`), which starts from `align/final`; its row lands in the same table.
+6. Then `experiments`, one `EXP` per session (`losses`, `oneshot`, `prune`, then `cr` and `latency`, which reuse the
+   pruned arms). Save the version and set `RESUME_FROM` to its output in the next session.
