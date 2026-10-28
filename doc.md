@@ -169,6 +169,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `pool_last_token(hidden, mask)` / `truncate_normalize(x, dim)` / `embed(model, ids, mask, dim)` | Last-token pooling (any padding side) / MRL truncate + L2 / both after a forward. |
 | `encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False)` | No-grad, length-sorted batches; fp16 CPU tensor `[N, dim]` in input order. `progress=True`: a `[encode cuda:0] b/n batches  elapsed  eta` line every ~5% (rank 0 only, labelled with the device), plain prints so they show from spawned workers. |
 | `get_device()`, `DTYPES` | `cuda:0` or CPU; `"fp32"/"fp16"/"bf16"` → torch dtype. |
+| `gpu_mem(device)` | `" (free/total GB free)"` on a CUDA device, counting every process on it; `""` on CPU. For the `[rank N]` step lines. |
 
 ### `data.py`
 | Function | What it does |
@@ -184,7 +185,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 ### `teacher.py`
 | Function | What it does |
 |---|---|
-| `embed_main(rank, world_size, cfg)` | Worker for `launch(embed_main, TEACHER)`. Rank r embeds shard r of each set; existing shards are skipped; rank 0 merges. Defaults in `TEACHER_DEFAULTS` (§4.1). |
+| `embed_main(rank, world_size, cfg)` | Worker for `launch(embed_main, TEACHER)`. Rank r embeds shard r of each set; existing shards are skipped; rank 0 merges. Every rank prints `[rank N]` step lines (joined, sets to embed, waiting for rank 0, model loaded + GPU free, shard embedded / saved, waiting to merge, done). Defaults in `TEACHER_DEFAULTS` (§4.1). |
 | `merge_shards(emb_dir, name, world_size, ids)` | Shards → `<name>.npy` + `<name>_ids.json`. |
 | `fp16_sanity(model_name, texts, dim, max_len, device, device_map_fp32=None)` | fp16 vs fp32 cosine (mean, min), NaN rows. Use `device_map_fp32="auto"` for the 4B model (16 GB in fp32). |
 | `time_embedding(cfg, data, device, world_size, n_sample=2000, budget_h=5.0)` | tokens/s on a passage sample → projected hours for all sets. Report only. |
@@ -217,7 +218,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 ### `align.py`
 | Function | What it does |
 |---|---|
-| `align_main(rank, world_size, cfg)` | Worker for `launch(align_main, ALIGN)`. Frozen fp32 base + adapter, DDP over adapter params, AdamW (separate LoRA / head lr), linear warmup + cosine, fp16 autocast + GradScaler on CUDA, grad clip. Each epoch one seeded permutation; rank r takes its slice of every global batch, ragged tail dropped. Logs / evals / saves on rank 0. |
+| `align_main(rank, world_size, cfg)` | Worker for `launch(align_main, ALIGN)`. Frozen fp32 base + adapter, DDP over adapter params, AdamW (separate LoRA / head lr), linear warmup + cosine, fp16 autocast + GradScaler on CUDA, grad clip. Each epoch one seeded permutation; rank r takes its slice of every global batch, ragged tail dropped. Logs / evals / saves on rank 0; every rank prints `[rank N]` step lines (joined, model loaded + GPU free, DDP wrap, waiting at a barrier). |
 | `LOSSES`, `l2_loss(student, teacher)` | Loss registry; `l2` = squared L2 between unit vectors (= 2 − 2 cos). |
 | `run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, batch_loss, data, tag)` | The loop shared by phases 2 and 3: optimizer, schedule, amp, resume, DDP, log / eval / save, `final/`. `batch_loss(ddp_model, global_idx, local, epoch)` returns `{"loss", ...logged parts}`. |
 | `load_rank0_first`, `final_exists`, `load_val`, `evaluate_val`, `save_checkpoint`, `log_row` | Loop helpers: rank-0-first download, no-op check, in-training val (L2, cos, nDCG@10, Recall@10), step checkpoint + `keep_last`, `log.jsonl`. |

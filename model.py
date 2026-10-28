@@ -19,6 +19,14 @@ def get_device():
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
+def gpu_mem(device):
+    """' (free/total GB free)' on a CUDA device, counting every process on it (e.g. the notebook's own); '' on CPU."""
+    if device.type != "cuda":
+        return ""
+    free, total = torch.cuda.mem_get_info(device)
+    return f" ({free / 2**30:.1f}/{total / 2**30:.1f} GB free)"
+
+
 def load_tokenizer(name):
     tokenizer = AutoTokenizer.from_pretrained(name, padding_side="left")
     if tokenizer.pad_token is None:

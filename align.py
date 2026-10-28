@@ -17,10 +17,10 @@ import numpy as np
 import torch
 
 from data import load_emb, load_json, resolve_cfg
-from ddp import barrier, cleanup, is_main, reduce_mean, setup, wrap_ddp
+from ddp import barrier, cleanup, get_rank, is_main, reduce_mean, setup, wrap_ddp
 from evaluation import score
-from model import (TRAINER_STATE, attach_adapter, embed, encode, load_adapter_weights, load_encoder, save_adapter,
-                   tokenize, trainable_params)
+from model import (TRAINER_STATE, attach_adapter, embed, encode, gpu_mem, load_adapter_weights, load_encoder,
+                   save_adapter, tokenize, trainable_params)
 
 ALIGN_DEFAULTS = dict(
     model="Qwen/Qwen3-Embedding-0.6B",  # student base: hub id or local dir; frozen, fp32 (amp does the speed-up)
@@ -80,6 +80,7 @@ def align_main(rank, world_size, cfg):
     """One worker of ddp.launch(align_main, cfg). Resumes from the latest step checkpoint; no-op if final/ exists."""
     cfg = resolve_cfg(ALIGN_DEFAULTS, cfg)
     device = setup(rank, world_size)
+    print(f"[rank{rank}] joined process group on {device}{gpu_mem(device)}", flush=True)
     try:
         if not final_exists(cfg["out_dir"]):
             train(rank, world_size, cfg, device)
@@ -133,9 +134,13 @@ def final_exists(out_dir):
 
 def load_rank0_first(name, device):
     """load_encoder on every rank; rank 0 downloads first, the others then read the HF cache."""
+    rank = get_rank()
     if not is_main():
+        print(f"[rank{rank}] waiting for rank 0 to load the model", flush=True)
         barrier()
+    print(f"[rank{rank}] loading {name}", flush=True)
     model, tokenizer = load_encoder(name, device)
+    print(f"[rank{rank}] model loaded on {device}{gpu_mem(device)}", flush=True)
     if is_main():
         barrier()
     return model, tokenizer
@@ -177,7 +182,9 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
         val = load_val(data, cfg)
 
     model.train()
+    print(f"[rank{rank}] wrapping in DDP{gpu_mem(device)}", flush=True)
     ddp_model = wrap_ddp(model, device)
+    print(f"[rank{rank}] training from step {step} of {total}", flush=True)
     local = slice(rank * bs, (rank + 1) * bs)
     epoch, order, t0 = None, None, time.perf_counter()
     while step < total:
@@ -204,14 +211,19 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
         if (cfg["eval_every"] and step % cfg["eval_every"] == 0) or step == total:
             if is_main():
                 log_row(cfg, tag, dict(step=step, **evaluate_val(model, tokenizer, val, cfg, device)))
+            else:
+                print(f"[rank{rank}] step {step}: waiting for rank 0 to evaluate", flush=True)
             barrier()
         if step % cfg["save_every"] == 0 and step < total:
             if is_main():
                 save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler)
+            else:
+                print(f"[rank{rank}] step {step}: waiting for rank 0 to save", flush=True)
             barrier()
     if is_main():
         save_adapter(model, os.path.join(cfg["out_dir"], "final"), adapter_cfg)
         print(f"[{tag}] done: {cfg['out_dir']}/final")
+    print(f"[rank{rank}] training loop finished, waiting for all ranks", flush=True)
     barrier()
 
 

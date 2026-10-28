@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from align import final_exists, l2_loss, load_rank0_first, run
 from data import load_emb, load_json, resolve_cfg
 from ddp import cleanup, setup
-from model import ADAPTER_CONFIG, adapter_params, embed, tokenize
+from model import ADAPTER_CONFIG, adapter_params, embed, gpu_mem, tokenize
 
 REFINE_DEFAULTS = dict(
     init_adapter="runs/align/final",    # phase-2 adapter dir (LoRA + head trained further) or a pruned one (all weights)
@@ -87,6 +87,7 @@ def refine_main(rank, world_size, cfg):
     """One worker of ddp.launch(refine_main, cfg). Resumes from the latest step checkpoint; no-op if final/ exists."""
     cfg = resolve_cfg(REFINE_DEFAULTS, cfg)
     device = setup(rank, world_size)
+    print(f"[rank{rank}] joined process group on {device}{gpu_mem(device)}", flush=True)
     try:
         if not final_exists(cfg["out_dir"]):
             train(rank, world_size, cfg, device)
@@ -119,6 +120,7 @@ def train(rank, world_size, cfg, device):
         for p in lora + head:
             p.requires_grad_(True)
     docs = torch.from_numpy(docs).to(device)
+    print(f"[rank{rank}] corpus on {device}{gpu_mem(device)}, mining negatives", flush=True)
     neg = mine_negatives(teacher_q, docs.float(), queries["pos"], queries["neg"], cfg["n_neg"])  # same on every rank
     batch_loss = functools.partial(_refine_batch_loss, tokenizer=tokenizer, queries=queries, neg=neg,
                                    docs=docs, teacher_q=teacher_q, cfg=cfg, device=device)

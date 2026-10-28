@@ -48,8 +48,8 @@ Do not report a change as done unless this passes.
 - Every result-affecting knob lives in the notebook control panel and in `TEACHER_DEFAULTS` / `ALIGN_DEFAULTS` /
   `REFINE_DEFAULTS`.
   Nothing result-affecting hard-coded in a module.
-- DDP: workers live in .py files with signature `(rank, world_size, cfg)`; print/save only on rank 0; every rank hits
-  the same collectives.
+- DDP: workers live in .py files with signature `(rank, world_size, cfg)`; print/save only on rank 0 (exception: short
+  `[rank N]` step lines on every rank, so a hang shows where each rank is); every rank hits the same collectives.
 - New module or model change → test in `tests/`.
 - Docs and notebooks use `from model import ...`, never `import model`.
 - Data provenance: `negative_passages` are NOT verified to be BM25. Don't claim they are.

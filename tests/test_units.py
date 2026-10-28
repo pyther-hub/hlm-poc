@@ -4,7 +4,7 @@ import torch
 
 from conftest import tiny_rows
 from data import build_data, resolve_cfg
-from model import embed, encode, load_encoder, tokenize, truncate_normalize
+from model import embed, encode, gpu_mem, load_encoder, tokenize, truncate_normalize
 from teacher import TEACHER_DEFAULTS
 
 DEVICE = torch.device("cpu")
@@ -47,6 +47,10 @@ def test_tokenize_ends_with_eot(encoder):
 def test_truncate_normalize_unit_norm():
     x = truncate_normalize(torch.randn(5, 64) * 7, 16)
     assert x.shape == (5, 16) and torch.allclose(x.norm(dim=-1), torch.ones(5), atol=1e-6)
+
+
+def test_gpu_mem_empty_on_cpu():
+    assert gpu_mem(torch.device("cpu")) == ""
 
 
 def test_encode_progress_prints_lines(encoder, capsys):

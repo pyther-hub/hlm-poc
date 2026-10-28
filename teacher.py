@@ -9,7 +9,7 @@ import torch
 
 from data import load_json, resolve_cfg, save_json
 from ddp import barrier, cleanup, is_main, setup
-from model import DTYPES, encode, load_encoder
+from model import DTYPES, encode, gpu_mem, load_encoder
 
 QUERY_PROMPT = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
 
@@ -40,38 +40,46 @@ def embed_main(rank, world_size, cfg):
     """One worker of ddp.launch(embed_main, cfg). Shards that already exist are skipped (resumable)."""
     cfg = resolve_cfg(TEACHER_DEFAULTS, cfg)
     device = setup(rank, world_size)
+    print(f"[rank{rank}] joined process group on {device}{gpu_mem(device)}", flush=True)
     try:
         data = load_json(cfg["data_path"])
         os.makedirs(cfg["emb_dir"], exist_ok=True)
         todo = [s for s in cfg["sets"]
                 if not all(os.path.exists(shard_path(cfg["emb_dir"], s, r, world_size)) for r in range(world_size))
                 and not os.path.exists(os.path.join(cfg["emb_dir"], f"{s}.npy"))]
+        print(f"[rank{rank}] sets to embed: {todo or 'none'}", flush=True)
         barrier()  # everyone decides `todo` before anyone writes
         if todo:
             if not is_main():
+                print(f"[rank{rank}] waiting for rank 0 to load the model", flush=True)
                 barrier()  # rank 0 downloads first, the others read the HF cache
+            print(f"[rank{rank}] loading {cfg['model']} ({cfg['dtype']})", flush=True)
             model, tokenizer = load_encoder(cfg["model"], device, DTYPES[cfg["dtype"]])
+            print(f"[rank{rank}] model loaded on {device}{gpu_mem(device)}", flush=True)
             if is_main():
                 barrier()
             for name in todo:
                 path = shard_path(cfg["emb_dir"], name, rank, world_size)
                 if os.path.exists(path):
+                    print(f"[rank{rank}] {name}: shard exists, skipped", flush=True)
                     continue
                 texts = data[name]["texts"]
                 lo, hi = _shard_bounds(len(texts), rank, world_size)
                 prefix, max_len = _set_args(cfg, name)
-                if is_main():
-                    print(f"[teacher] {name}: {len(texts)} texts, {hi - lo} on this rank")
+                print(f"[rank{rank}] {name}: embedding texts {lo}:{hi} of {len(texts)}", flush=True)
                 emb = encode(model, tokenizer, texts[lo:hi], device, cfg["dim"], max_len, prefix,
                              cfg["batch_size"], progress=True)
                 np.save(path + ".tmp.npy", emb.numpy())
                 os.replace(path + ".tmp.npy", path)
+                print(f"[rank{rank}] {name}: saved {path}", flush=True)
             del model
+        print(f"[rank{rank}] waiting for all ranks before merging", flush=True)
         barrier()
         if is_main():
             for name in cfg["sets"]:
                 merge_shards(cfg["emb_dir"], name, world_size, data[name]["ids"])
         barrier()
+        print(f"[rank{rank}] done", flush=True)
     except BaseException:
         traceback.print_exc()  # print now: cleanup() can hang while another rank waits, hiding this
         raise

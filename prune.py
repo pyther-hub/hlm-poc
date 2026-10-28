@@ -14,7 +14,7 @@ import torch
 from align import _align_batch_loss, final_exists, l2_loss, load_rank0_first, run
 from data import load_emb, load_json, resolve_cfg
 from ddp import cleanup, setup
-from model import ADAPTER_CONFIG, attach_head, load_adapter_weights, merge_lora, prune_model
+from model import ADAPTER_CONFIG, attach_head, gpu_mem, load_adapter_weights, merge_lora, prune_model
 
 PRUNE_DEFAULTS = dict(
     init="runs/align/final",            # phase-2 adapter or previous pruned stage; read only
@@ -85,6 +85,7 @@ def prune_main(rank, world_size, cfg):
     """One worker of ddp.launch(prune_main, cfg). Resumes from the latest step checkpoint; no-op if final/ exists."""
     cfg = resolve_cfg(PRUNE_DEFAULTS, cfg)
     device = setup(rank, world_size)
+    print(f"[rank{rank}] joined process group on {device}{gpu_mem(device)}", flush=True)
     try:
         if not final_exists(cfg["out_dir"]):
             train(rank, world_size, cfg, device)
@@ -101,6 +102,7 @@ def train(rank, world_size, cfg, device):
     targets, ids = load_emb(cfg["teacher_emb_dir"], "align")
     assert ids == data["align"]["ids"], "align: teacher vectors don't match data.json"
     model, tokenizer, adapter_cfg = pruned_student(cfg["init"], cfg["n_layers"], cfg["ffn_keep"], device)
+    print(f"[rank{rank}] pruned to {len(adapter_cfg['keep_layers'])} layers{gpu_mem(device)}", flush=True)
     assert adapter_cfg["out_dim"] == cfg["dim"] == targets.shape[1], \
         f"init dim {adapter_cfg['out_dim']}, cfg dim {cfg['dim']}, teacher dim {targets.shape[1]}"
     model.requires_grad_(True)
