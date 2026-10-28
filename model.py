@@ -79,7 +79,7 @@ def embed(model, input_ids, attention_mask, dim):
 @torch.no_grad()
 def encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False):
     """Unit-norm [N, dim] fp16 CPU tensor in input order. Batches are length-sorted so little compute goes to padding.
-    progress=True prints a line every ~5% of batches (rank 0 only), labelled with the device. Plain prints, not tqdm:
+    progress=True prints a line every ~1% of batches (rank 0 only), labelled with the device. Plain prints, not tqdm:
     a tqdm bar drawn in a spawned worker doesn't show up in the notebook. Longest texts go first, so the early ETA is
     pessimistic."""
     model.eval()
@@ -88,7 +88,7 @@ def encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_si
     out = torch.empty(len(texts), dim, dtype=torch.float16)
     use_amp = amp and device.type == "cuda" and next(model.parameters()).dtype == torch.float32
     n_batches = -(-len(texts) // batch_size)
-    log_every = max(1, n_batches // 20)
+    log_every = max(1, n_batches // 100)
     t0 = time.perf_counter()
     for b, start in enumerate(range(0, len(texts), batch_size)):
         idx = order[start:start + batch_size]

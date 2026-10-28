@@ -167,7 +167,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `load_encoder(name, device, dtype=fp32, device_map=None)` | `name` = hub id, local dir, or adapter dir (→ `load_adapter`). Returns a frozen, eval-mode `(model, tokenizer)`. `AutoModel` with sdpa. A missing local dir raises `FileNotFoundError`. `device_map="auto"` spreads a model over GPUs. |
 | `tokenize(tokenizer, texts, max_length, prefix="")` | Left-padded batch ending in end-of-text (appended if the tokenizer doesn't). |
 | `pool_last_token(hidden, mask)` / `truncate_normalize(x, dim)` / `embed(model, ids, mask, dim)` | Last-token pooling (any padding side) / MRL truncate + L2 / both after a forward. |
-| `encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False)` | No-grad, length-sorted batches; fp16 CPU tensor `[N, dim]` in input order. `progress=True`: a `[encode cuda:0] b/n batches  elapsed  eta` line every ~5% (rank 0 only, labelled with the device), plain prints so they show from spawned workers. |
+| `encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False)` | No-grad, length-sorted batches; fp16 CPU tensor `[N, dim]` in input order. `progress=True`: a `[encode cuda:0] b/n batches  elapsed  eta` line every ~1% (rank 0 only, labelled with the device), plain prints so they show from spawned workers. |
 | `get_device()`, `DTYPES` | `cuda:0` or CPU; `"fp32"/"fp16"/"bf16"` → torch dtype. |
 | `gpu_mem(device)` | `" (free/total GB free)"` on a CUDA device, counting every process on it; `""` on CPU. For the `[rank N]` step lines. |
 
