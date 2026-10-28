@@ -135,8 +135,7 @@ vectors) and are picked in the control panel with `loss` / `loss_kwargs`. They c
 the DDP workers are spawned processes and only receive importable functions.
 
 Rows: `base_student_own_index` (00), `teacher` (01), `aligned`, `prog_l14`, `prog_l7` (02), `<student>_cr` (03).
-"P@100" is reported as `recall@100` (~1 positive per query, so precision@100 ≤ 0.01). `run_exp.py` also keeps
-`exp_losses`, `exp_oneshot` and direct pruning (`exp_prune`), which no notebook calls now.
+"P@100" is reported as `recall@100` (~1 positive per query, so precision@100 ≤ 0.01).
 
 **Pruning** (`prune.py`): from an adapter dir, LoRA merged into the base (`merge_lora`) or a previous pruned stage;
 keep `n_layers` evenly spaced layers (first and last always) and `ffn_keep` of each kept layer's FFN neurons, by
@@ -235,12 +234,8 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 ### `run_exp.py`
 | Function | What it does |
 |---|---|
-| `exp_losses(align_cfg, losses, data, index, exp_dir, ev, nprocs)` | Phase 2 per arm `{arm: (loss, kwargs)}`; curves + bars + table. |
-| `exp_oneshot(align_cfg, refine_cfg, aligned, data, index, exp_dir, ev, nprocs)` | Fresh adapter → `refine_main` with `l2_weight=0` for ≈ align + CR steps, vs `aligned` and `aligned_cr`. |
-| `exp_prune(prune_cfg, aligned, stages, direct, data, index, exp_dir, ev, nprocs)` | Progressive `prog_l<n>` chain and direct `direct_l<n>`; metric vs layers plot. |
 | `exp_cr(refine_cfg, students, data, index, exp_dir, ev, nprocs)` | `<student>_cr` per student; gains printed, bars + curves. |
 | `exp_latency(models, data, index, exp_dir, device, dim, n_queries, batch_sizes)` | `measure_latency` per model (first = reference) → `latency.json`, speedups; mean cos(q, d+) on val; plot. |
-| `kl_loss(student, teacher, tau)`, `exp_align_main` | KaLM-style KL over the batch's teacher vectors; `align_main` with `"kl"` registered in the worker (L2 stays the default elsewhere). |
 | `train_once`, `evaluate_runs`, `cos_to_positive`, `plot_curves`, `plot_bars`, `print_rows`, `save_fig` | Skip finished arms / rows (+ the teacher row); helpers. |
 | `mine_negatives(teacher_q, docs, pos, neg, n_neg, chunk=256)` | `[N, n_neg]` negative corpus rows per query: stored negative first, then the top teacher-scored docs excluding positives and the stored one. `n_neg=1` skips scoring. |
 | `contrastive_loss(q, docs, pos_col, known_pos, tau, margin)` | L_CR with doc + same-tower query negatives and false-negative masking; returns `(loss, masked fraction)`. |
@@ -307,7 +302,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `lr`, `head_lr`, `weight_decay`, `warmup_ratio` | `2e-5`, `1e-4`, `0.0`, `0.05` | AdamW over every weight / the head; warmup then cosine to 0. |
 | `epochs`, `batch_size`, `grad_clip`, `amp`, `seed` | `1`, `64`, `1.0`, `True`, `0` | `batch_size` per GPU. |
 | `log_every`, `eval_every`, `save_every`, `keep_last` | `20`, `200`, `500`, `2` | Steps. Debug: `5 / 20 / 20`. |
-| `data_path`, `teacher_emb_dir`, `out_dir` | `cache/data.json`, `cache/emb/teacher`, `runs/prune` | Set per arm by `run_exp.exp_prune`. |
+| `data_path`, `teacher_emb_dir`, `out_dir` | `cache/data.json`, `cache/emb/teacher`, `runs/prune` | `out_dir` set per stage in 02. |
 
 ---
 
@@ -333,7 +328,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_select_layers`, `test_prune_keep_all_is_identity`, `test_ffn_pruning_drops_dead_neurons` | Layer choice; surgery that changes outputs when it shouldn't; neuron scores / slicing. |
 | `test_merge_lora_matches_hooks`, `test_pruned_checkpoint_roundtrip_and_chain`, `test_full_model_trains_every_weight` | Merged LoRA ≠ hooked LoRA; full checkpoints not reloading; progressive indices not relative to the base; frozen weights in a full fine-tune. |
 | `test_prune_main_trains_pruned_student`, `test_refine_trains_pruned_student` | 2-process pruning trains and saves a 1-layer full checkpoint; CR on it trains. |
-| `test_kl_loss_zero_iff_same`, `test_lora_trainable_params_match_adapter_params`, `test_evaluate_runs_adds_teacher_and_resumes` | KL scale; LoRA optimizer groups changed (breaks resume); finished rows re-evaluated; plots. |
+| `test_lora_trainable_params_match_adapter_params`, `test_evaluate_runs_adds_teacher_and_resumes` | LoRA optimizer groups changed (breaks resume); finished rows re-evaluated; plots. |
 | `test_expected_notebooks`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
 
 ## 6. Workflow

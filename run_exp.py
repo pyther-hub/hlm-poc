@@ -1,11 +1,8 @@
-"""Experiments on top of the phases: one plain function per experiment, called from notebooks/experiments.ipynb.
+"""Experiments on top of the phases: one plain function per experiment, called from notebooks/02-04.
 Every arm is a run dir <exp_dir>/<arm>/ (adapter checkpoints + log.jsonl, as in align / refine / prune) and a row in
 <exp_dir>/metrics.json; plots go to <exp_dir>/plots/. An arm whose final/ exists is not retrained and a row already
 in metrics.json is not re-evaluated, so re-running an experiment (e.g. in a new Kaggle session) resumes it.
 The teacher is frozen and its cached vectors are reused; nothing here re-embeds the corpus.
-  exp_losses   alignment loss: L2 vs KL (KaLM-style)
-  exp_oneshot  one-shot contrastive training straight from the base student vs align -> CR
-  exp_prune    progressive vs direct pruning
   exp_cr       before vs after contrastive refinement, full and pruned students
   exp_latency  query-encoding latency / throughput per model + the cos(q, d+) shift across phases"""
 import os
@@ -13,34 +10,14 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 
-import align
-from align import align_main, read_log
+from align import read_log
 from data import load_json, save_json
 from ddp import launch
 from evaluation import evaluate_model, measure_latency, save_metrics, teacher_ceiling
-from model import attach_adapter, encode, load_encoder, save_adapter
-from prune import prune_main
+from model import encode, load_encoder
 from refine import refine_main
 from teacher import free_gpu_memory
-
-
-# ---------- experimental loss (only for exp_losses; L2 stays the default everywhere) ----------
-
-def kl_loss(student, teacher, tau=0.05):
-    """KaLM-style distillation: KL(p_T || p_S), where p_X(i, .) = softmax_j(x_i . t_j / tau) over the batch's teacher
-    query vectors t_j."""
-    log_p_student = F.log_softmax(student @ teacher.T / tau, -1)
-    p_teacher = F.softmax(teacher @ teacher.T / tau, -1)
-    return F.kl_div(log_p_student, p_teacher, reduction="batchmean")
-
-
-def exp_align_main(rank, world_size, cfg):
-    """align_main with kl_loss available as loss="kl". Registered here, in the spawned worker: a registration made in
-    the notebook process doesn't reach the workers."""
-    align.LOSSES["kl"] = kl_loss
-    align_main(rank, world_size, cfg)
 
 
 # ---------- shared ----------
@@ -115,23 +92,6 @@ def print_rows(metrics, names, split="test", keys=("recall@100", "recall@10", "n
 
 # ---------- experiments ----------
 
-def exp_losses(align_cfg, losses, data, index, exp_dir, ev, nprocs):
-    """#3 alignment loss. losses: {arm: (loss name, loss_kwargs)}, e.g. {"align_l2": ("l2", {}),
-    "align_kl": ("kl", {"tau": 0.05})}. Each arm = phase 2 from scratch with that loss, everything else align_cfg."""
-    runs = {}
-    for arm, (loss, kwargs) in losses.items():
-        cfg = {**align_cfg, "loss": loss, "loss_kwargs": kwargs, "out_dir": os.path.join(exp_dir, arm)}
-        runs[arm] = train_once(exp_align_main, cfg, nprocs)
-    metrics = evaluate_runs(runs, data, index, exp_dir, ev)
-    dirs = {arm: os.path.join(exp_dir, arm) for arm in losses}
-    figs = [save_fig(plot_curves(dirs, ("train_loss", "val_loss", "val_ndcg@10"), "alignment loss"), exp_dir,
-                     "losses_curves"),
-            save_fig(plot_bars(metrics, list(losses), title="alignment loss (test)"), exp_dir, "losses_bars")]
-    print("train_loss is each arm's own loss; val_loss is L2 for every arm (comparable)")
-    print_rows(metrics, list(losses))
-    return dict(metrics=metrics, figs=figs)
-
-
 def exp_cr(refine_cfg, students, data, index, exp_dir, ev, nprocs):
     """#2 before vs after CR. students: {name: adapter dir}, e.g. the phase-2 adapter and the pruned 4-layer ones.
     Each gets refine_cfg (row "<name>_cr"); a pruned (full) student trains every weight, a LoRA one its adapter."""
@@ -149,72 +109,6 @@ def exp_cr(refine_cfg, students, data, index, exp_dir, ev, nprocs):
             save_fig(plot_curves({f"{s}_cr": os.path.join(exp_dir, f"{s}_cr") for s in students},
                                  ("cr", "val_ndcg@10"), "CR training"), exp_dir, "cr_curves")]
     print_rows(metrics, names)
-    return dict(metrics=metrics, figs=figs)
-
-
-def exp_oneshot(align_cfg, refine_cfg, aligned, data, index, exp_dir, ev, nprocs):
-    """#1 proxy. "oneshot" = a fresh adapter on the base student trained only with L_CR (l2_weight=0) against the frozen
-    teacher docs, for about as many steps as align + CR together. Compared with "aligned" (phase-2 adapter dir) and
-    "aligned_cr" (shared with exp_cr when run there first). Not the paper's baseline: the doc tower isn't trained."""
-    init = os.path.join(exp_dir, "oneshot_init")
-    if not os.path.exists(init):
-        model, _ = load_encoder(align_cfg["model"], torch.device("cpu"))
-        torch.manual_seed(align_cfg["seed"])
-        attach_adapter(model, align_cfg["lora_rank"], align_cfg["lora_alpha"], align_cfg["lora_dropout"],
-                       align_cfg["lora_targets"], align_cfg["dim"])
-        save_adapter(model, init, dict(base=align_cfg["model"], rank=align_cfg["lora_rank"],
-                                       alpha=align_cfg["lora_alpha"], dropout=align_cfg["lora_dropout"],
-                                       targets=list(align_cfg["lora_targets"]), out_dim=align_cfg["dim"]))
-        del model
-    align_steps = len(data["align"]["ids"]) // (align_cfg["batch_size"] * nprocs) * align_cfg["epochs"]
-    cr_per_epoch = len(data["train"]["ids"]) // (refine_cfg["batch_size"] * nprocs)
-    epochs = max(1, round((align_steps + cr_per_epoch * refine_cfg["epochs"]) / cr_per_epoch))
-    print(f"[oneshot] align {align_steps} + CR {cr_per_epoch * refine_cfg['epochs']} steps -> one-shot {epochs} "
-          f"epochs = {epochs * cr_per_epoch} steps")
-    runs = {"aligned": aligned}
-    runs["aligned_cr"] = train_once(refine_main, {**refine_cfg, "init_adapter": aligned,
-                                                  "out_dir": os.path.join(exp_dir, "aligned_cr")}, nprocs)
-    runs["oneshot"] = train_once(refine_main, {**refine_cfg, "init_adapter": init, "l2_weight": 0.0, "epochs": epochs,
-                                               "out_dir": os.path.join(exp_dir, "oneshot")}, nprocs)
-    metrics = evaluate_runs(runs, data, index, exp_dir, ev)
-    figs = [save_fig(plot_bars(metrics, list(runs), title="one-shot CL vs align -> CR (test)"), exp_dir,
-                     "oneshot_bars"),
-            save_fig(plot_curves({"oneshot": os.path.join(exp_dir, "oneshot"),
-                                  "aligned_cr": os.path.join(exp_dir, "aligned_cr")}, ("cr", "val_ndcg@10"),
-                                 "one-shot vs CR after alignment"), exp_dir, "oneshot_curves")]
-    print_rows(metrics, list(runs))
-    return dict(metrics=metrics, figs=figs)
-
-
-def exp_prune(prune_cfg, aligned, stages, direct, data, index, exp_dir, ev, nprocs):
-    """#5 progressive vs direct pruning, full fine-tune at every stage. Progressive: aligned -> stages[0] -> stages[1]
-    ... layers ("prog_l<n>"), each stage cutting prune_cfg["ffn_keep"] of the FFN width. Direct: aligned -> `direct`
-    layers in one cut ("direct_l<n>") with the same final FFN width (ffn_keep ** stages used to reach it)."""
-    runs, init = {"aligned": aligned}, aligned
-    for n in stages:
-        cfg = {**prune_cfg, "init": init, "n_layers": n, "out_dir": os.path.join(exp_dir, f"prog_l{n}")}
-        init = runs[f"prog_l{n}"] = train_once(prune_main, cfg, nprocs)
-    cuts = stages.index(direct) + 1
-    cfg = {**prune_cfg, "init": aligned, "n_layers": direct, "ffn_keep": prune_cfg["ffn_keep"] ** cuts,
-           "out_dir": os.path.join(exp_dir, f"direct_l{direct}")}
-    runs[f"direct_l{direct}"] = train_once(prune_main, cfg, nprocs)
-    metrics = evaluate_runs(runs, data, index, exp_dir, ev)
-
-    fig, ax = plt.subplots(figsize=(6, 3.8))
-    layers = [28] + list(stages)
-    for key, style in (("recall@100", "-o"), ("ndcg@10", "-s")):
-        ax.plot(layers, [metrics[n]["test"][key] for n in ["aligned"] + [f"prog_l{s}" for s in stages]], style,
-                label=f"progressive {key}")
-        ax.plot([direct], [metrics[f"direct_l{direct}"]["test"][key]], "x", markersize=10, mew=2,
-                label=f"direct 28->{direct} {key}")
-    ax.set(xlabel="decoder layers", ylabel="test", title="progressive vs direct pruning", xscale="log", ylim=(0, 1))
-    ax.set_xticks(layers, [str(n) for n in layers])
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=8)
-    figs = [save_fig(fig, exp_dir, "prune_layers"),
-            save_fig(plot_curves({n: os.path.join(exp_dir, n) for n in runs if n != "aligned"},
-                                 ("train_loss", "val_ndcg@10"), "pruning recovery"), exp_dir, "prune_curves")]
-    print_rows(metrics, list(runs))
     return dict(metrics=metrics, figs=figs)
 
 
