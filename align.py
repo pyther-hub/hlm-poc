@@ -2,7 +2,8 @@
 head to the teacher dim) trained so its query vectors match the teacher's cached query vectors (emb/teacher/align.npy).
 DDP: one process per GPU, each takes its slice of every global batch; only the adapter has gradients.
 Checkpoints are adapter-only (model.save_adapter): <out_dir>/step_<n>/ (+ trainer_state.pt, resumable) and
-<out_dir>/final/, which load_encoder / evaluate_model accept like a model dir."""
+<out_dir>/final/, which load_encoder / evaluate_model accept like a model dir.
+The training loop (run) and its helpers are shared with refine.py; each phase only supplies its batch loss."""
 import functools
 import glob
 import json
@@ -79,11 +80,8 @@ def align_main(rank, world_size, cfg):
     cfg = resolve_cfg(ALIGN_DEFAULTS, cfg)
     device = setup(rank, world_size)
     try:
-        if os.path.exists(os.path.join(cfg["out_dir"], "final")):
-            if is_main():
-                print(f"[align] {cfg['out_dir']}/final exists, nothing to do")
-            return
-        train(rank, world_size, cfg, device)
+        if not final_exists(cfg["out_dir"]):
+            train(rank, world_size, cfg, device)
     finally:
         cleanup()
 
@@ -96,29 +94,63 @@ def train(rank, world_size, cfg, device):
     assert targets.shape[1] == cfg["dim"], f"teacher dim {targets.shape[1]} != cfg dim {cfg['dim']}"
     targets = torch.from_numpy(targets.astype(np.float32))
 
-    if not is_main():
-        barrier()  # rank 0 downloads first, the others read the HF cache
-    model, tokenizer = load_encoder(cfg["model"], device)
-    if is_main():
-        barrier()
+    model, tokenizer = load_rank0_first(cfg["model"], device)
     torch.manual_seed(cfg["seed"])  # same adapter init on every rank (DDP also broadcasts it from rank 0)
     attach_adapter(model, cfg["lora_rank"], cfg["lora_alpha"], cfg["lora_dropout"], cfg["lora_targets"], cfg["dim"])
     adapter_cfg = dict(base=cfg["model"], rank=cfg["lora_rank"], alpha=cfg["lora_alpha"], dropout=cfg["lora_dropout"],
                        targets=list(cfg["lora_targets"]), out_dim=cfg["dim"])
+    loss_fn = functools.partial(LOSSES[cfg["loss"]], **cfg["loss_kwargs"])
+    batch_loss = functools.partial(_align_batch_loss, tokenizer=tokenizer, texts=texts, targets=targets,
+                                   loss_fn=loss_fn, cfg=cfg, device=device)
+    run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, len(texts), batch_loss, data, "align")
+
+
+def _align_batch_loss(model, global_idx, local, epoch, tokenizer, texts, targets, loss_fn, cfg, device):
+    idx = global_idx[local]
+    enc = tokenize(tokenizer, [texts[i] for i in idx], cfg["max_query_len"], cfg["query_prefix"])
+    student = embed(model, enc["input_ids"].to(device), enc["attention_mask"].to(device), cfg["dim"])
+    return {"loss": loss_fn(student.float(), targets[idx].to(device))}
+
+
+# ---------- shared by align_main and refine.refine_main ----------
+
+def final_exists(out_dir):
+    if os.path.exists(os.path.join(out_dir, "final")):
+        if is_main():
+            print(f"[train] {out_dir}/final exists, nothing to do")
+        return True
+    return False
+
+
+def load_rank0_first(name, device):
+    """load_encoder on every rank; rank 0 downloads first, the others then read the HF cache."""
+    if not is_main():
+        barrier()
+    model, tokenizer = load_encoder(name, device)
+    if is_main():
+        barrier()
+    return model, tokenizer
+
+
+def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, batch_loss, data, tag):
+    """The training loop over n_items examples, shared by the phases. Only the adapter trains (DDP over its params).
+    batch_loss(ddp_model, global_idx, local, epoch) -> {"loss": tensor, other logged parts...}: global_idx is the
+    whole global batch (same on every rank), global_idx[local] this rank's share. Each epoch is one seeded
+    permutation; the ragged tail is dropped so every rank runs the same steps. Logs / evals / saves on rank 0;
+    resumes from the latest step checkpoint; writes <out_dir>/final at the end."""
     lora, head = adapter_params(model)
     params = lora + head
-
-    per_step = cfg["batch_size"] * world_size
-    steps_per_epoch = len(texts) // per_step  # drop the ragged tail: every rank runs the same number of steps
+    bs = cfg["batch_size"]
+    per_step = bs * world_size
+    steps_per_epoch = n_items // per_step
     total = steps_per_epoch * cfg["epochs"]
-    assert total > 0, f"{len(texts)} align queries < one global batch of {per_step}"
+    assert total > 0, f"{n_items} examples < one global batch of {per_step}"
     warmup = int(cfg["warmup_ratio"] * total)
     opt = torch.optim.AdamW([{"params": lora, "lr": cfg["lr"]}, {"params": head, "lr": cfg["head_lr"]}],
                             weight_decay=cfg["weight_decay"])
     sched = torch.optim.lr_scheduler.LambdaLR(opt, functools.partial(lr_factor, warmup=warmup, total=total))
     use_amp = cfg["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    loss_fn = functools.partial(LOSSES[cfg["loss"]], **cfg["loss_kwargs"])
 
     step = 0
     ckpt = (step_checkpoints(cfg["out_dir"]) or [None])[-1]
@@ -131,25 +163,23 @@ def train(rank, world_size, cfg, device):
         step = state["step"]
     if is_main():
         n_params = sum(p.numel() for p in params)
-        print(f"[align] {len(texts)} queries, global batch {per_step}, {steps_per_epoch} steps/epoch, {total} steps, "
+        print(f"[{tag}] {n_items} examples, global batch {per_step}, {steps_per_epoch} steps/epoch, {total} steps, "
               f"{n_params / 1e6:.2f}M trainable params" + (f", resumed from {ckpt}" if ckpt else ""))
-        val = _load_val(data, cfg)
+        val = load_val(data, cfg)
 
     model.train()
     ddp_model = wrap_ddp(model, device)
+    local = slice(rank * bs, (rank + 1) * bs)
     epoch, order, t0 = None, None, time.perf_counter()
     while step < total:
         if step // steps_per_epoch != epoch:
             epoch = step // steps_per_epoch
-            order = epoch_order(len(texts), cfg["seed"], epoch)
-        start = (step % steps_per_epoch) * per_step + rank * cfg["batch_size"]
-        idx = order[start:start + cfg["batch_size"]]
-        enc = tokenize(tokenizer, [texts[i] for i in idx], cfg["max_query_len"], cfg["query_prefix"])
+            order = epoch_order(n_items, cfg["seed"], epoch)
+        start = (step % steps_per_epoch) * per_step
         with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-            student = embed(ddp_model, enc["input_ids"].to(device), enc["attention_mask"].to(device), cfg["dim"])
-        loss = loss_fn(student.float(), targets[idx].to(device))
+            parts = batch_loss(ddp_model, order[start:start + per_step], local, epoch)
         opt.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
+        scaler.scale(parts["loss"]).backward()
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(params, cfg["grad_clip"])
         scaler.step(opt)
@@ -158,25 +188,25 @@ def train(rank, world_size, cfg, device):
         step += 1
 
         if step % cfg["log_every"] == 0 or step == total:
-            train_loss = reduce_mean(loss.item(), device)
+            means = {("train_loss" if k == "loss" else k): reduce_mean(float(v), device) for k, v in parts.items()}
             if is_main():
-                _log(cfg, dict(step=step, epoch=epoch, train_loss=train_loss, lr=sched.get_last_lr()[0],
-                               min=(time.perf_counter() - t0) / 60))
+                log_row(cfg, tag, dict(step=step, epoch=epoch, **means, lr=sched.get_last_lr()[0],
+                                       min=(time.perf_counter() - t0) / 60))
         if (cfg["eval_every"] and step % cfg["eval_every"] == 0) or step == total:
             if is_main():
-                _log(cfg, dict(step=step, **_evaluate(model, tokenizer, val, cfg, device, loss_fn)))
+                log_row(cfg, tag, dict(step=step, **evaluate_val(model, tokenizer, val, cfg, device)))
             barrier()
         if step % cfg["save_every"] == 0 and step < total:
             if is_main():
-                _save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler)
+                save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler)
             barrier()
     if is_main():
         save_adapter(model, os.path.join(cfg["out_dir"], "final"), adapter_cfg)
-        print(f"[align] done: {cfg['out_dir']}/final")
+        print(f"[{tag}] done: {cfg['out_dir']}/final")
     barrier()
 
 
-def _load_val(data, cfg):
+def load_val(data, cfg):
     """Rank 0's in-training eval set: val queries, their teacher vectors, the teacher corpus."""
     val_t, ids = load_emb(cfg["teacher_emb_dir"], "val")
     assert ids == data["val"]["ids"], "val: teacher vectors don't match data.json"
@@ -185,28 +215,28 @@ def _load_val(data, cfg):
                 docs=docs)
 
 
-def _evaluate(model, tokenizer, val, cfg, device, loss_fn):
-    """Val loss against the teacher's val vectors + retrieval from the teacher corpus."""
+def evaluate_val(model, tokenizer, val, cfg, device):
+    """L2 + cosine to the teacher's val vectors, and retrieval from the teacher corpus."""
     q = encode(model, tokenizer, val["texts"], device, cfg["dim"], cfg["max_query_len"], cfg["query_prefix"],
                cfg["batch_size"]).float()
     model.train()  # encode switched it to eval
     m = score(q.numpy(), val["docs"], val["pos"], device=device)
-    return {"val_loss": loss_fn(q, val["teacher"]).item(), "val_ndcg@10": m["ndcg@10"],
+    return {"val_loss": l2_loss(q, val["teacher"]).item(), "val_ndcg@10": m["ndcg@10"],
             "val_recall@10": m["recall@10"], "val_cos": (q * val["teacher"]).sum(-1).mean().item()}
 
 
-def _save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler):
+def save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler):
     path = os.path.join(cfg["out_dir"], f"step_{step:07d}")
     save_adapter(model, path, adapter_cfg, dict(step=step, opt=opt.state_dict(), sched=sched.state_dict(),
                                                  scaler=scaler.state_dict()))
     for p in step_checkpoints(cfg["out_dir"])[:-cfg["keep_last"]]:
         shutil.rmtree(p)
-    print(f"[align] saved {path}")
+    print(f"[train] saved {path}")
 
 
-def _log(cfg, row):
+def log_row(cfg, tag, row):
     """Print + append to <out_dir>/log.jsonl (rank 0)."""
-    print("[align] " + "  ".join(f"{k} {v:.4g}" if isinstance(v, float) else f"{k} {v}" for k, v in row.items()),
+    print(f"[{tag}] " + "  ".join(f"{k} {v:.4g}" if isinstance(v, float) else f"{k} {v}" for k, v in row.items()),
           flush=True)
     os.makedirs(cfg["out_dir"], exist_ok=True)
     with open(os.path.join(cfg["out_dir"], "log.jsonl"), "a") as f:

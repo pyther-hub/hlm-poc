@@ -1,10 +1,11 @@
 # hlm-poc
 
 Proof of concept: a small student query encoder (Qwen3-Embedding-0.6B) is trained to retrieve against a frozen
-teacher document index (Qwen3-Embedding-4B, d=256). **Current scope: phase 1 (teacher embeddings + their evaluation)
-and phase 2 (alignment fine-tuning: LoRA r=16 + linear head, adapter-only checkpoints).** Experiments run in
-`notebooks/phase_1_teacher.ipynb`, `notebooks/phase_1_eval.ipynb` and `notebooks/phase_2_align.ipynb` on Kaggle
-(GPU T4 x2). This repo only
+teacher document index (Qwen3-Embedding-4B, d=256). **Current scope: phase 1 (teacher embeddings + their evaluation),
+phase 2 (alignment fine-tuning: LoRA r=16 + linear head, adapter-only checkpoints) and phase 3 (contrastive
+refinement of that adapter against the frozen teacher doc vectors).** Experiments run in
+`notebooks/phase_1_teacher.ipynb`, `notebooks/phase_1_eval.ipynb`, `notebooks/phase_2_align.ipynb` and
+`notebooks/phase_3_refine.ipynb` on Kaggle (GPU T4 x2). This repo only
 holds clean, tested functions it imports. Same conventions as tiny-reasoner: flat files, plain functions, no classes,
 no global state, no config system. Keep the code raw, simple and easy to debug. Pruning is out of scope.
 
@@ -44,7 +45,8 @@ Do not report a change as done unless this passes.
 
 ## Rules
 - Modes: `DEBUG=True` (small data, same models) or full. No tiny/test mode in the library or notebook.
-- Every result-affecting knob lives in the notebook control panel and in `TEACHER_DEFAULTS` / `ALIGN_DEFAULTS`.
+- Every result-affecting knob lives in the notebook control panel and in `TEACHER_DEFAULTS` / `ALIGN_DEFAULTS` /
+  `REFINE_DEFAULTS`.
   Nothing result-affecting hard-coded in a module.
 - DDP: workers live in .py files with signature `(rank, world_size, cfg)`; print/save only on rank 0; every rank hits
   the same collectives.

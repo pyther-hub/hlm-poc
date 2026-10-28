@@ -6,7 +6,7 @@ the query side changes.
 
 **Current scope.** Phase 1: build the MS MARCO data, embed it with the teacher on 2 GPUs, and evaluate retrieval on
 val/test against that index. Phase 2: alignment fine-tuning of the student (LoRA r=16 + linear head, DDP) onto the
-teacher's query vectors. Experiments run on Kaggle (GPU T4 x2). This repo holds
+teacher's query vectors. Phase 3: contrastive refinement of that adapter against the frozen teacher document vectors. Experiments run on Kaggle (GPU T4 x2). This repo holds
 the flat, tested functions the notebooks import: plain functions, no classes, no global state, no config system.
 
 ---
@@ -15,19 +15,22 @@ the flat, tested functions the notebooks import: plain functions, no classes, no
 
 ### 0.1 Modules
 ```
-       notebooks/phase_1_teacher.ipynb (4 steps)        notebooks/phase_1_eval.ipynb (5 steps)
-              │                 │                                  │     notebooks/phase_2_align.ipynb (4 steps)
-       ┌──────▼───┐       ┌─────▼──────┐                  ┌────────▼───────┐       ┌──────▼─────┐
-       │ data.py  │       │ teacher.py │  embed_main,     │ evaluation.py  │◀──────│  align.py  │ align_main,
-       │ rows,    │       │            │  merge_shards,   │                │       │            │ LOSSES
-       │ splits,  │       └─────┬──────┘  fp16_sanity,    └────────┬───────┘       └──────┬─────┘
-       │ corpus   │             │         time_embedding           │                      │
-       └────┬─────┘       ┌─────▼──────────────────────────────────▼──────────────────────▼─┐
-            └────────────▶│ model.py  load_encoder · tokenize · encode · attach/save_adapter │
-                          └─────┬───────────────────────────────────────────────────────────┘
-                          ┌─────▼─────┐
-                          │  ddp.py   │  launch/setup/barrier/is_main (no-ops without a process group)
-                          └───────────┘
+ phase_1_teacher.ipynb         phase_1_eval.ipynb         phase_2_align.ipynb     phase_3_refine.ipynb
+      │            │                    │                          │                       │
+ ┌────▼─────┐ ┌────▼───────┐    ┌───────▼────────┐          ┌──────▼──────┐         ┌──────▼──────┐
+ │ data.py  │ │ teacher.py │    │ evaluation.py  │◀─────────│  align.py   │◀────────│  refine.py  │
+ │ rows,    │ │ embed_main,│    │ load_index,    │          │ align_main, │         │ refine_main,│
+ │ splits,  │ │ merge_     │    │ teacher_ceiling│          │ LOSSES,     │         │ contrastive_│
+ │ corpus,  │ │ shards,    │    │ evaluate_model,│          │ run (loop   │         │ loss        │
+ │ I/O      │ │ fp16_sanity│    │ summarize,     │          │ shared by   │         │             │
+ │          │ │ time_embed.│    │ measure_latency│          │ phases 2+3) │         │             │
+ └────┬─────┘ └────┬───────┘    └───────┬────────┘          └──────┬──────┘         └──────┬──────┘
+      │       ┌────▼────────────────────▼──────────────────────────▼───────────────────────▼─┐
+      └──────▶│ model.py  load_encoder · tokenize · encode · attach_adapter · save/load_adapter│
+              └────┬─────────────────────────────────────────────────────────────────────────┘
+              ┌────▼──────┐
+              │  ddp.py   │  launch/setup/barrier/is_main (no-ops without a process group)
+              └───────────┘
 ```
 
 ### 0.2 Data flow
@@ -47,6 +50,9 @@ phase_1_eval (1 GPU): queries (cached teacher vectors, or any model) → top-100
    ▼
 align_main (2 GPUs, DDP): student(align query) ≈ teacher align.npy, adapter only
    ─▶ runs/<mode>/align/{step_<n>, final}/ adapter.pt + adapter_config.json, log.jsonl
+   ▼
+refine_main (2 GPUs, DDP): from align/final; L_CR over train queries vs teacher corpus.npy + λ·L2 to teacher q
+   ─▶ runs/<mode>/refine/{step_<n>, final}/, log.jsonl
 ```
 
 Adapter (`model.attach_adapter`, plain parameters + forward hooks, no wrapper classes):
@@ -125,6 +131,24 @@ Phase 2: open `notebooks/phase_2_align.ipynb` with the same `DEBUG` value (GPU T
 | 3 · Training log | Train loss and the in-training val rows (val loss, val cos, nDCG@10, Recall@10) from `log.jsonl`. |
 | 4 · Evaluate | `evaluate_model(OUT_DIR/final, ...)` on val/test → row `aligned_r<rank>_<loss>` in `runs/<mode>/eval/metrics.json`, then `summarize`. |
 
+Phase 3: open `notebooks/phase_3_refine.ipynb` with the same `DEBUG` value (GPU T4 x2), after phase 2 wrote `align/final`.
+
+| Cell | What it does |
+|---|---|
+| Control panel | `DEBUG`, `NPROCS`, paths (`INIT_ADAPTER` = `runs/<mode>/align/final`), `REFINE` (all of `REFINE_DEFAULTS`, §4.5). |
+| 1 · Check inputs | Adapter config matches `dim`; `check_emb` on `corpus`, `align`, `val`; every train query has a teacher vector. |
+| 2 · Train | `launch(refine_main, REFINE, nprocs=NPROCS)`. Resumable, no-op once `final/` exists. |
+| 3 · Training log | `loss`, `cr` (contrastive), `l2`, `masked` (fraction of negatives masked), val rows. |
+| 4 · Evaluate | `evaluate_model(OUT_DIR/final, ...)` → row `refined_tau<τ>_l2w<λ>` in the shared `metrics.json`, then `summarize`. |
+
+Phase-3 loss, per GPU (B queries) with the global batch's docs (positive + stored `negative[0]` of every query in
+it, all ranks; the docs are frozen teacher vectors, so no gather is needed):
+```
+logits_i = [ s(q_i, d_j) for all 2·B·world docs ] ++ [ s(q_i, q_j) for the B queries on this GPU ]   / tau
+masked   = q_i's other labelled positives, q_i itself, and any negative with s > s(q_i, d_i+) + margin
+L        = CE(logits, own positive) + l2_weight · ||q_i − teacher(q_i)||²
+```
+
 **Loss functions** live in `align.LOSSES` (name → `fn(student, teacher, **loss_kwargs)`, both `[B, dim]` unit
 vectors) and are picked in the control panel with `loss` / `loss_kwargs`. They can't be defined in a notebook cell:
 the DDP workers are spawned processes and only receive importable functions.
@@ -196,7 +220,15 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 |---|---|
 | `align_main(rank, world_size, cfg)` | Worker for `launch(align_main, ALIGN)`. Frozen fp32 base + adapter, DDP over adapter params, AdamW (separate LoRA / head lr), linear warmup + cosine, fp16 autocast + GradScaler on CUDA, grad clip. Each epoch one seeded permutation; rank r takes its slice of every global batch, ragged tail dropped. Logs / evals / saves on rank 0. |
 | `LOSSES`, `l2_loss(student, teacher)` | Loss registry; `l2` = squared L2 between unit vectors (= 2 − 2 cos). |
+| `run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, batch_loss, data, tag)` | The loop shared by phases 2 and 3: optimizer, schedule, amp, resume, DDP, log / eval / save, `final/`. `batch_loss(ddp_model, global_idx, local, epoch)` returns `{"loss", ...logged parts}`. |
+| `load_rank0_first`, `final_exists`, `load_val`, `evaluate_val`, `save_checkpoint`, `log_row` | Loop helpers: rank-0-first download, no-op check, in-training val (L2, cos, nDCG@10, Recall@10), step checkpoint + `keep_last`, `log.jsonl`. |
 | `step_checkpoints(out_dir)`, `read_log(out_dir)` | Finished `step_<n>` dirs, oldest first / rows of `log.jsonl`. |
+
+### `refine.py`
+| Function | What it does |
+|---|---|
+| `refine_main(rank, world_size, cfg)` | Worker for `launch(refine_main, REFINE)`. Loads `init_adapter` (base + adapter), unfreezes the adapter, trains the train split with `align.run`. Writes only to `out_dir`. |
+| `contrastive_loss(q, docs, pos_col, known_pos, tau, margin)` | L_CR with doc + same-tower query negatives and false-negative masking; returns `(loss, masked fraction)`. |
 
 ### `ddp.py`
 `launch(fn, *args, nprocs)`, `setup`, `cleanup`, `barrier`, `is_main`, `get_rank`, `get_world_size`,
@@ -239,6 +271,17 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `log_every`, `eval_every`, `save_every`, `keep_last` | `20`, `200`, `500`, `2` | Steps. Debug: `5 / 20 / 20`. |
 | `data_path`, `teacher_emb_dir`, `out_dir` | `cache/data.json`, `cache/emb/teacher`, `runs/align` | The notebook sets them under `{debug,full}`. |
 
+### 4.5 `REFINE` (`refine.REFINE_DEFAULTS`)
+| Key | Default | Meaning |
+|---|---|---|
+| `init_adapter` | `"runs/align/final"` | Phase-2 adapter dir; read only. LoRA shape and dropout come from its config. |
+| `dim`, `query_prefix`, `max_query_len` | `256`, `""`, `32` | Must match phase 2 / the teacher index. |
+| `tau`, `margin`, `l2_weight` | `0.05`, `0.1`, `0.1` | Temperature; false-negative margin; λ of the L2 term (0 = pure L_CR). |
+| `lr`, `head_lr`, `weight_decay`, `warmup_ratio` | `5e-5`, `1e-4`, `0.0`, `0.05` | AdamW; warmup then cosine to 0. |
+| `epochs`, `batch_size`, `grad_clip`, `amp`, `seed` | `1`, `64`, `1.0`, `True`, `0` | `batch_size` = queries per GPU (docs per step = 2 · batch_size · world_size). |
+| `log_every`, `eval_every`, `save_every`, `keep_last` | `20`, `200`, `500`, `2` | Steps. Debug: `5 / 20 / 20`. |
+| `data_path`, `teacher_emb_dir`, `out_dir` | `cache/data.json`, `cache/emb/teacher`, `runs/refine` | The notebook sets them under `{debug,full}`. |
+
 ---
 
 ## 5. Tests (`tests/`, CPU, offline, < 30 s)
@@ -257,6 +300,8 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_adapter_starts_as_base_plus_head`, `test_adapter_checkpoint_roundtrip` | LoRA changing the model at init; checkpoints holding base weights or not reloading to the same vectors. |
 | `test_l2_loss_is_two_minus_two_cos` | Loss scale. |
 | `test_align_trains_and_keeps_last_checkpoints`, `test_align_resumes_from_latest_checkpoint` | 2-process alignment: loss goes down, `keep_last`, final adapter evaluates; a re-run resumes mid-run instead of restarting. |
+| `test_contrastive_loss_by_hand`, `test_contrastive_loss_masks_negatives_above_margin` | L_CR formula, known-positive masking, margin masking (a masked doc = an absent doc). |
+| `test_refine_trains_from_adapter` | 2-process refinement from a saved adapter: contrastive loss goes down, val rows logged, the init adapter untouched, final adapter evaluates. |
 | `test_expected_notebooks`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
 
 ## 6. Workflow
@@ -264,3 +309,4 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 2. On Kaggle: re-run the setup cell, run with `DEBUG = True`, then `DEBUG = False`.
 3. After the teacher index exists: run `phase_1_eval` with the same `DEBUG` value.
 4. Then `phase_2_align` (same `DEBUG`); its final adapter is scored into the same `metrics.json`.
+5. Then `phase_3_refine` (same `DEBUG`), which starts from `align/final`; its row lands in the same table.
