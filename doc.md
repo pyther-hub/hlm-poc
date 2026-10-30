@@ -99,7 +99,7 @@ notebook ── launch(embed_main, TEACHER) ──▶ mp.spawn ─┬─ rank 0 
 ---
 
 ## 1. Using it on Kaggle
-Four notebooks, one Kaggle session each, run in order. Notebook settings: **Accelerator → GPU T4 x2**, **Internet ON**.
+Four notebooks (plus the independent `05`), one Kaggle session each, run in order. Notebook settings: **Accelerator → GPU T4 x2**, **Internet ON**.
 Cell 1 clones the repo (`git pull` on later runs), upgrades `transformers` if older than 4.56 (restart the kernel once
 if it says so) and installs `datasets`, `pyarrow`, `accelerate` if missing. Cell 2 is the control panel. Run everything
 with `DEBUG = True` first, then `DEBUG = False`; use the same value in all four.
@@ -112,6 +112,7 @@ Off Kaggle every `IN_*` is the repo dir.
 ```
 01 ─ data.json, emb/teacher/*.npy, metrics(teacher)
    ─▶ 02 ─ aligned/, prog_l14/, prog_l7/ ─▶ 03 ─ <student>_cr/ ─▶ 04 (reads 01, 02, 03)
+   ─▶ 05 ─ bge_aligned/, bge_aligned_cr/   (independent of 02 / 03; reads 01 only)
 ```
 
 | Notebook | GPUs | Cells |
@@ -120,6 +121,7 @@ Off Kaggle every `IN_*` is the repo dir.
 | `02_student_alignment_and_pruning` | 2 | `train_once(align_main, ALIGN)` → `aligned` (LoRA + head, L2) · for n in `STAGES` (14, 7): `train_once(prune_main, ...)` from the previous stage → `prog_l<n>` (full fine-tune, L2, `ffn_keep=1.0`) · curves · `evaluate_runs` + `print_rows` · `measure_latency` per stage. |
 | `03_contrastive_refinement` | 2 | Show train triples · `exp_cr(REFINE, STUDENTS, ...)`: `refine_main` from each of `aligned`, `prog_l14`, `prog_l7` → `<student>_cr`, gains vs the pre-refinement row, bars + curves. |
 | `04_retrieval_evaluation_and_ablation` | 1 | `evaluate_runs` fills missing rows · `summarize` val/test · `exp_latency` (teacher first: params, fp16 MB, ms/query, q/s, speedup, cos(q, d+)) · ablation table (each prune cut, each refinement; ndcg@10 and recall@100) + bars. |
+| `05_bge_small_align_and_refine` | 2 | Second student `BAAI/bge-small-en-v1.5` (BERT, 33M), **full fine-tune** + head 384→256, no LoRA, no pruning: `train_once(align_main, ALIGN)` with `full=True` → `bge_aligned` (L2) · `exp_cr(REFINE, {"bge_aligned": ...})` → `bge_aligned_cr` (every weight) · curves · `print_rows` val/test · `measure_latency`. |
 
 Sessions are capped at 9 h. Every training / embedding step is resumable (`step_<n>/` checkpoints, existing shards
 skipped) and a finished stage (`final/` exists) is skipped.
@@ -165,8 +167,9 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | Function | What it does |
 |---|---|
 | `load_encoder(name, device, dtype=fp32, device_map=None)` | `name` = hub id, local dir, or adapter dir (→ `load_adapter`). Returns a frozen, eval-mode `(model, tokenizer)`. `AutoModel` with sdpa. A missing local dir raises `FileNotFoundError`. `device_map="auto"` spreads a model over GPUs. |
-| `tokenize(tokenizer, texts, max_length, prefix="")` | Left-padded batch ending in end-of-text (appended if the tokenizer doesn't). |
-| `pool_last_token(hidden, mask)` / `truncate_normalize(x, dim)` / `embed(model, ids, mask, dim)` | Last-token pooling (any padding side) / MRL truncate + L2 / both after a forward. |
+| `is_bert(model)` | BERT-style encoder (`config.model_type == "bert"`, e.g. bge-small; DDP-wrapped ok). For it `load_encoder` sets right padding and drops the unused pooler, `embed` uses CLS pooling, `attach_head` hooks the last layer's output LayerNorm. Derived from the model, not a cfg knob: fixed by pretraining. |
+| `tokenize(tokenizer, texts, max_length, prefix="")` | Padded batch (left for Qwen, right for BERT) ending in end-of-text / `[SEP]` (appended if the tokenizer adds neither). |
+| `pool_last_token(hidden, mask)` / `truncate_normalize(x, dim)` / `embed(model, ids, mask, dim)` | Last-token pooling (any padding side) / MRL truncate + L2 / both after a forward (CLS instead of last token for BERT). |
 | `encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False)` | No-grad, length-sorted batches; fp16 CPU tensor `[N, dim]` in input order. `progress=True`: a `[encode cuda:0] b/n batches  elapsed  eta` line every ~1% (rank 0 only, labelled with the device), plain prints so they show from spawned workers. |
 | `get_device()`, `DTYPES` | `cuda:0` or CPU; `"fp32"/"fp16"/"bf16"` → torch dtype. |
 | `gpu_mem(device)` | `" (free/total GB free)"` on a CUDA device, counting every process on it; `""` on CPU. For the `[rank N]` step lines. |
@@ -207,7 +210,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | Function | What it does |
 |---|---|
 | `attach_adapter(model, rank, alpha, dropout, targets, out_dim)` | LoRA (A Kaiming, B zero) on every `nn.Linear` named in `targets` + `align_head` Linear(hidden → out_dim) after the final norm. Hooks, no wrapper modules. |
-| `attach_head(model, out_dim)` | Just the `align_head` (used by `attach_adapter` and by fully trained models). |
+| `attach_head(model, out_dim)` | Just the `align_head` (used by `attach_adapter` and by fully trained models), on the final norm (Qwen) or the last layer's output LayerNorm (BERT). |
 | `adapter_params(model)` | `(lora params, head params)`. |
 | `trainable_params(model)` | `(body, head)` among `requires_grad` params; body = LoRA for a frozen base, every weight for a full model. `align.run`'s optimizer groups. |
 | `merge_lora(model, path)` | Fold an adapter dir's LoRA into the base weights (`W += α/r · B A`) and attach its head; no hooks. |
@@ -218,7 +221,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 ### `align.py`
 | Function | What it does |
 |---|---|
-| `align_main(rank, world_size, cfg)` | Worker for `launch(align_main, ALIGN)`. Frozen fp32 base + adapter, DDP over adapter params, AdamW (separate LoRA / head lr), linear warmup + cosine, fp16 autocast + GradScaler on CUDA, grad clip. Each epoch one seeded permutation; rank r takes its slice of every global batch, ragged tail dropped. Logs / evals / saves on rank 0; every rank prints `[rank N]` step lines (joined, model loaded + GPU free, DDP wrap, waiting at a barrier). |
+| `align_main(rank, world_size, cfg)` | Worker for `launch(align_main, ALIGN)`. Frozen fp32 base + adapter (or, `full=True`, head only and every weight trains: `adapter_config.json` gets `full`, phase 3 then trains every weight too), DDP over the trainable params, AdamW (separate LoRA / head lr), linear warmup + cosine, fp16 autocast + GradScaler on CUDA, grad clip. Each epoch one seeded permutation; rank r takes its slice of every global batch, ragged tail dropped. Logs / evals / saves on rank 0; every rank prints `[rank N]` step lines (joined, model loaded + GPU free, DDP wrap, waiting at a barrier). |
 | `LOSSES`, `l2_loss(student, teacher)` | Loss registry; `l2` = squared L2 between unit vectors (= 2 − 2 cos). |
 | `run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, batch_loss, data, tag)` | The loop shared by phases 2 and 3: optimizer, schedule, amp, resume, DDP, log / eval / save, `final/`. `batch_loss(ddp_model, global_idx, local, epoch)` returns `{"loss", ...logged parts}`. |
 | `load_rank0_first`, `final_exists`, `load_val`, `evaluate_val`, `save_checkpoint`, `log_row` | Loop helpers: rank-0-first download, no-op check, in-training val (L2, cos, nDCG@10, Recall@10), step checkpoint + `keep_last`, `log.jsonl`. |
@@ -277,6 +280,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 |---|---|---|
 | `model` | `"Qwen/Qwen3-Embedding-0.6B"` | Student base, frozen, loaded fp32. |
 | `dim` | `256` | Head output = teacher index dim. |
+| `full` | `False` | `True`: no LoRA, every base weight + head trains (`lora_*` ignored; `lr` is then the base weights' lr). Notebook 05. |
 | `lora_rank`, `lora_alpha`, `lora_dropout` | `16`, `32`, `0.05` | LoRA scale = alpha / rank. |
 | `lora_targets` | `q,k,v,o,gate,up,down _proj` | Every linear in the decoder. |
 | `query_prefix`, `max_query_len` | `""`, `32` | Student queries. |
@@ -335,6 +339,8 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_merge_lora_matches_hooks`, `test_pruned_checkpoint_roundtrip_and_chain`, `test_full_model_trains_every_weight` | Merged LoRA ≠ hooked LoRA; full checkpoints not reloading; progressive indices not relative to the base; frozen weights in a full fine-tune. |
 | `test_prune_main_trains_pruned_student`, `test_refine_trains_pruned_student` | 2-process pruning trains and saves a 1-layer full checkpoint; CR on it trains. |
 | `test_lora_trainable_params_match_adapter_params`, `test_evaluate_runs_adds_teacher_and_resumes` | LoRA optimizer groups changed (breaks resume); finished rows re-evaluated; plots. |
+| `test_bert_cls_pooling_ignores_padding`, `test_bert_head_on_last_layernorm` | BERT left-padded (shifts absolute positions) or pooled from the wrong token; head not on the final hidden states. |
+| `test_full_align_trains_every_weight`, `test_refine_from_full_bert` | 2-process `full=True` alignment of a tiny BERT: base weights move, the checkpoint is the full state dict without LoRA; CR from it trains and evaluates. |
 | `test_expected_notebooks`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
 
 ## 6. Workflow

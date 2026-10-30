@@ -19,12 +19,13 @@ import torch
 from data import load_emb, load_json, resolve_cfg
 from ddp import barrier, cleanup, get_rank, is_main, reduce_mean, setup, wrap_ddp
 from evaluation import score
-from model import (TRAINER_STATE, attach_adapter, embed, encode, gpu_mem, load_adapter_weights, load_encoder,
+from model import (TRAINER_STATE, attach_adapter, attach_head, embed, encode, gpu_mem, load_adapter_weights, load_encoder,
                    save_adapter, tokenize, trainable_params)
 
 ALIGN_DEFAULTS = dict(
     model="Qwen/Qwen3-Embedding-0.6B",  # student base: hub id or local dir; frozen, fp32 (amp does the speed-up)
     dim=256,                            # head output = teacher index dim
+    full=False,                         # True: no LoRA, train every base weight + head (lora_* ignored)
     lora_rank=16,
     lora_alpha=32,                      # scale = alpha / rank
     lora_dropout=0.05,
@@ -33,7 +34,7 @@ ALIGN_DEFAULTS = dict(
     max_query_len=32,
     loss="l2",                          # name in LOSSES
     loss_kwargs={},
-    lr=2e-4,                            # LoRA params
+    lr=2e-4,                            # LoRA params (every base weight if full)
     head_lr=1e-3,                       # head params
     weight_decay=0.0,
     warmup_ratio=0.05,                  # linear warmup, then cosine decay to 0
@@ -106,9 +107,15 @@ def train(rank, world_size, cfg, device):
     
     model, tokenizer = load_rank0_first(cfg["model"], device)
     torch.manual_seed(cfg["seed"])  # same adapter init on every rank (DDP also broadcasts it from rank 0)
-    attach_adapter(model, cfg["lora_rank"], cfg["lora_alpha"], cfg["lora_dropout"], cfg["lora_targets"], cfg["dim"])
-    adapter_cfg = dict(base=cfg["model"], rank=cfg["lora_rank"], alpha=cfg["lora_alpha"], dropout=cfg["lora_dropout"],
-                       targets=list(cfg["lora_targets"]), out_dim=cfg["dim"])
+    if cfg["full"]:
+        attach_head(model, cfg["dim"])
+        model.requires_grad_(True)
+        adapter_cfg = dict(base=cfg["model"], out_dim=cfg["dim"], full=True)
+    else:
+        attach_adapter(model, cfg["lora_rank"], cfg["lora_alpha"], cfg["lora_dropout"], cfg["lora_targets"],
+                       cfg["dim"])
+        adapter_cfg = dict(base=cfg["model"], rank=cfg["lora_rank"], alpha=cfg["lora_alpha"],
+                           dropout=cfg["lora_dropout"], targets=list(cfg["lora_targets"]), out_dim=cfg["dim"])
     loss_fn = functools.partial(LOSSES[cfg["loss"]], **cfg["loss_kwargs"])
     batch_loss = functools.partial(_align_batch_loss, tokenizer=tokenizer, texts=texts, targets=targets,
                                    loss_fn=loss_fn, cfg=cfg, device=device)

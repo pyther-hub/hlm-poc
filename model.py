@@ -45,16 +45,26 @@ def load_encoder(name, device, dtype=torch.float32, device_map=None):
     model = AutoModel.from_pretrained(name, dtype=dtype, attn_implementation="sdpa", device_map=device_map)
     if device_map is None:
         model = model.to(device=device, dtype=dtype)
+    if is_bert(model):  # absolute positions + CLS pooling: pad on the right
+        tokenizer.padding_side = "right"
+    if getattr(model, "pooler", None) is not None:  # BERT's pooler is never used (and has no grad under DDP)
+        model.pooler = None
     model.requires_grad_(False)
+    #this is the base mdoel hence graident is off for all parameters and lora is attached to the model for training
     return model.eval(), tokenizer
 
 
+def is_bert(model):
+    """BERT-style encoder (e.g. bge-small): CLS pooling, right padding. model may be DDP-wrapped."""
+    return getattr(model, "module", model).config.model_type == "bert"
+
+
 def tokenize(tokenizer, texts, max_length, prefix=""):
-    """Left-padded batch whose last real token is end-of-text, which last-token pooling reads.
-    The Qwen3-Embedding tokenizer appends <|endoftext|> itself (also after truncation);
-    for tokenizers that don't (GPT-2 in tests) it is appended here."""
+    """Padded batch (left for Qwen, right for BERT: see load_encoder) whose last real token is end-of-text, which
+    last-token pooling reads. The Qwen3-Embedding tokenizer appends <|endoftext|> itself (also after truncation),
+    a BERT tokenizer appends [SEP]; for tokenizers that do neither (GPT-2 in tests) it is appended here."""
     texts = [prefix + t for t in texts]
-    if tokenizer("a")["input_ids"][-1] == tokenizer.pad_token_id:
+    if tokenizer("a")["input_ids"][-1] in (tokenizer.pad_token_id, tokenizer.sep_token_id):
         return tokenizer(texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
     ids = tokenizer(texts, truncation=True, max_length=max_length - 1)["input_ids"]
     return tokenizer.pad({"input_ids": [x + [tokenizer.pad_token_id] for x in ids]}, return_tensors="pt")
@@ -73,7 +83,8 @@ def truncate_normalize(x, dim):
 
 def embed(model, input_ids, attention_mask, dim):
     hidden = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-    return truncate_normalize(pool_last_token(hidden, attention_mask), dim)
+    pooled = hidden[:, 0] if is_bert(model) else pool_last_token(hidden, attention_mask)  # BERT: CLS
+    return truncate_normalize(pooled, dim)
 
 
 @torch.no_grad()
@@ -138,10 +149,12 @@ def attach_adapter(model, rank, alpha, dropout, targets, out_dim):
 
 
 def attach_head(model, out_dim):
-    """Linear(hidden -> out_dim) on the final norm's output, so model(...).last_hidden_state is out_dim wide."""
-    w = model.norm.weight
+    """Linear(hidden -> out_dim) on the final norm's output, so model(...).last_hidden_state is out_dim wide.
+    BERT has no final norm: the last layer's output LayerNorm (nothing reads it after that, the pooler is removed)."""
+    norm = model.encoder.layer[-1].output.LayerNorm if is_bert(model) else model.norm
+    w = norm.weight
     model.align_head = nn.Linear(model.config.hidden_size, out_dim, dtype=w.dtype, device=w.device)
-    model.norm.register_forward_hook(functools.partial(_head_hook, model.align_head))
+    norm.register_forward_hook(functools.partial(_head_hook, model.align_head))
     return model
 
 
@@ -188,8 +201,10 @@ def prune_model(model, keep_layers, ffn_idx):
         mlp = layer.mlp
         idx = torch.as_tensor(idx, device=mlp.up_proj.weight.device)
         for lin, dim in ((mlp.gate_proj, 0), (mlp.up_proj, 0), (mlp.down_proj, 1)):
+            
             lin.weight = nn.Parameter(lin.weight.index_select(dim, idx).clone(), lin.weight.requires_grad)
             lin.in_features, lin.out_features = lin.weight.shape[1], lin.weight.shape[0]
+
         mlp.intermediate_size = len(idx)
         layer.self_attn.layer_idx = j
     config = model.config

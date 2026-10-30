@@ -8,7 +8,7 @@ import pytest
 NB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "notebooks")
 NOTEBOOKS = ["01_generate_teacher_embeddings.ipynb",
              "02_student_alignment_and_pruning.ipynb", "03_contrastive_refinement.ipynb",
-             "04_retrieval_evaluation_and_ablation.ipynb"]
+             "04_retrieval_evaluation_and_ablation.ipynb", "05_bge_small_align_and_refine.ipynb"]
 
 
 def strip_magics(src):

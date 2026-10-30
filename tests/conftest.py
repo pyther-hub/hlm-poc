@@ -44,6 +44,26 @@ def tiny_model_dir(tmp_path_factory):
     return path
 
 
+@pytest.fixture(scope="session")
+def tiny_bert_dir(tmp_path_factory):
+    """2-layer, hidden-64 random BERT (the bge-small architecture) + a WordPiece tokenizer over tiny_rows' words,
+    built from a vocab file (no download), saved as a plain model dir."""
+    from transformers import BertConfig, BertModel, BertTokenizerFast
+    path = str(tmp_path_factory.mktemp("tiny_bert"))
+    words = "river city music cell gold tax moon salt king rain bank code lake film bird wave".split()
+    digits = [str(i) for i in range(10)]
+    vocab = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "-"] + words + digits + ["##" + d for d in digits]
+    with open(os.path.join(path, "vocab.txt"), "w") as f:
+        f.write("\n".join(vocab) + "\n")
+    tokenizer = BertTokenizerFast(vocab_file=os.path.join(path, "vocab.txt"))
+    config = BertConfig(vocab_size=len(vocab), hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+                        num_attention_heads=4, max_position_embeddings=64)
+    torch.manual_seed(0)
+    BertModel(config).save_pretrained(path)
+    tokenizer.save_pretrained(path)
+    return path
+
+
 def build_teacher_index(emb_dir, data, model_dir, dim, sets):
     """What the teacher notebook writes, without DDP: each set encoded in-process as one shard, merged by
     teacher.merge_shards (so the on-disk layout is the real one)."""
