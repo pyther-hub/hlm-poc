@@ -24,7 +24,8 @@ Act as a skeptical senior engineer, not an order-taker.
 - Verify instead of asserting: run the tests or read the code. Say what you did not verify.
 
 ## Layout notes
-- `ddp.py` is copied verbatim from tiny-reasoner; keep the API identical.
+- `ddp.py` is copied verbatim from tiny-reasoner; keep the API identical. One approved change: `wrap_ddp` passes
+  `gradient_as_bucket_view=True` (memory for full fine-tunes on T4s).
 - Notebooks are edited by hand and committed without outputs.
 - The tiny random Qwen3 + GPT-2 tokenizer live ONLY in `tests/conftest.py`.
 - `doc.md` holds the code docs (design, API, cfg tables); update it when a public function or cfg key changes.

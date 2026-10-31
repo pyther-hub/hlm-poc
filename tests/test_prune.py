@@ -132,3 +132,15 @@ def test_refine_trains_pruned_student(run):
     assert any("cr" in r for r in read_log(refine_cfg["out_dir"]))
     model, _ = load_encoder(os.path.join(refine_cfg["out_dir"], "final"), DEVICE)
     assert len(model.layers) == 1
+
+
+def test_freeze_embeddings_keeps_them_and_trains_the_rest(run, tiny_model_dir):
+    prune_cfg, _ = run
+    out_dir = prune_cfg["out_dir"] + "_frozen_emb"
+    launch(prune_main, {**prune_cfg, "freeze_embeddings": True, "epochs": 1, "out_dir": out_dir}, nprocs=2)
+    base, _ = load_encoder(tiny_model_dir, DEVICE)
+    pruned, _ = load_encoder(os.path.join(out_dir, "final"), DEVICE)
+    assert torch.equal(pruned.embed_tokens.weight, base.embed_tokens.weight)  # LoRA never touches embeddings
+    trained, _ = load_encoder(os.path.join(prune_cfg["out_dir"], "final"), DEVICE)
+    assert not torch.equal(trained.embed_tokens.weight, base.embed_tokens.weight)  # unfrozen run does train them
+    assert not torch.equal(pruned.norm.weight, base.norm.weight)

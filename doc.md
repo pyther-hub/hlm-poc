@@ -223,7 +223,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 |---|---|
 | `align_main(rank, world_size, cfg)` | Worker for `launch(align_main, ALIGN)`. Frozen fp32 base + adapter (or, `full=True`, head only and every weight trains: `adapter_config.json` gets `full`, phase 3 then trains every weight too), DDP over the trainable params, AdamW (separate LoRA / head lr), linear warmup + cosine, fp16 autocast + GradScaler on CUDA, grad clip. Each epoch one seeded permutation; rank r takes its slice of every global batch, ragged tail dropped. Logs / evals / saves on rank 0; every rank prints `[rank N]` step lines (joined, model loaded + GPU free, DDP wrap, waiting at a barrier). |
 | `LOSSES`, `l2_loss(student, teacher)` | Loss registry; `l2` = squared L2 between unit vectors (= 2 − 2 cos). |
-| `run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, batch_loss, data, tag)` | The loop shared by phases 2 and 3: optimizer, schedule, amp, resume, DDP, log / eval / save, `final/`. A step is `grad_accum` micro-batches (DDP `no_sync` on all but the last); `patience > 0` keeps the lowest-val_loss weights in `best/` (weights only, overwritten), stops after `patience` evals without a drop and renames `best/` to `final/`. `batch_loss(ddp_model, global_idx, local, epoch)` returns `{"loss", ...logged parts}`. |
+| `run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, batch_loss, data, tag)` | The loop shared by phases 2 and 3: optimizer, schedule, amp, resume, DDP, log / eval / save, `final/`. A step is `grad_accum` micro-batches (DDP `no_sync` on all but the last); `patience > 0` keeps the lowest-val_loss weights in `best/` (weights only, overwritten), stops after `patience` evals without a drop and renames `best/` to `final/`. After every eval each rank prints its GPU peak (allocated / reserved) since the previous eval. `batch_loss(ddp_model, global_idx, local, epoch)` returns `{"loss", ...logged parts}`. |
 | `load_rank0_first`, `final_exists`, `load_val`, `evaluate_val`, `save_checkpoint`, `log_row` | Loop helpers: rank-0-first download, no-op check, in-training val (L2, cos, nDCG@10, Recall@10), step checkpoint + `keep_last`, `log.jsonl`. |
 | `step_checkpoints(out_dir)`, `read_log(out_dir)` | Finished `step_<n>` dirs, oldest first / rows of `log.jsonl`. |
 
@@ -250,7 +250,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 
 ### `ddp.py`
 `launch(fn, *args, nprocs)`, `setup`, `cleanup`, `barrier`, `is_main`, `get_rank`, `get_world_size`,
-`reduce_mean`, `wrap_ddp`, `unwrap`. Copied from tiny-reasoner; all are no-ops without a process group.
+`reduce_mean`, `wrap_ddp`, `unwrap`. Copied from tiny-reasoner; all are no-ops without a process group. One change: `wrap_ddp` uses `gradient_as_bucket_view=True` (grads are views into the all-reduce buckets, no second fp32 copy).
 
 ---
 
@@ -311,6 +311,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 |---|---|---|
 | `init` | `"runs/align/final"` | Phase-2 adapter or a previous pruned stage; read only. |
 | `n_layers`, `ffn_keep` | `14`, `0.75` | Layers kept (evenly spaced over the init's); fraction of the init's FFN width kept. |
+| `freeze_embeddings` | `False` | `True`: the token embeddings keep the init's values (no grads / AdamW state; Qwen3: 155M params, ~1.9 GB on a full fine-tune). |
 | `dim`, `query_prefix`, `max_query_len` | `256`, `""`, `32` | Must match phase 2 / the teacher index. |
 | `lr`, `head_lr`, `weight_decay`, `warmup_ratio` | `2e-5`, `1e-4`, `0.0`, `0.05` | AdamW over every weight / the head; warmup then cosine to 0. |
 | `epochs`, `batch_size`, `grad_clip`, `amp`, `seed` | `1`, `64`, `1.0`, `True`, `0` | `batch_size` per GPU. |
@@ -336,6 +337,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_adapter_starts_as_base_plus_head`, `test_adapter_checkpoint_roundtrip` | LoRA changing the model at init; checkpoints holding base weights or not reloading to the same vectors. |
 | `test_l2_loss_is_two_minus_two_cos` | Loss scale. |
 | `test_align_trains_and_keeps_last_checkpoints`, `test_align_resumes_from_latest_checkpoint` | 2-process alignment: loss goes down, `keep_last`, final adapter evaluates; a re-run resumes mid-run instead of restarting. |
+| `test_freeze_embeddings_keeps_them_and_trains_the_rest` | `freeze_embeddings` not freezing them, or freezing more than them. |
 | `test_grad_accum_matches_bigger_batch`, `test_early_stop_keeps_best` | `grad_accum=2` at half the batch drifting from one big batch; early stop not stopping, leaving `best/` or step dirs, or `final/` not being the lowest-val_loss weights. |
 | `test_contrastive_loss_by_hand`, `test_contrastive_loss_masks_negatives_above_margin` | L_CR formula, known-positive masking, margin masking (a masked doc = an absent doc). |
 | `test_mine_negatives`, `test_refine_with_mined_negatives` | Mined negatives skip positives and the stored negative (`n_neg=1` = stored only); a 2-process run with `n_neg=3` trains and saves. |

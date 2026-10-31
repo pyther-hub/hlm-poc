@@ -244,6 +244,11 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
             else:
                 print(f"[rank{rank}] step {step}: waiting for rank 0 to evaluate", flush=True)
             barrier()
+            if device.type == "cuda":  # peak since the previous eval, train steps + (rank 0) this eval
+                print(f"[rank{rank}] step {step}: GPU peak {torch.cuda.max_memory_allocated(device) / 2**30:.1f} GB "
+                      f"allocated, {torch.cuda.max_memory_reserved(device) / 2**30:.1f} GB reserved{gpu_mem(device)}",
+                      flush=True)
+                torch.cuda.reset_peak_memory_stats(device)
             if reduce_mean(stop, device) > 0:  # every rank takes rank 0's decision
                 if is_main():
                     print(f"[{tag}] early stop at step {step}: val_loss did not improve for {bad} evals "

@@ -70,7 +70,9 @@ def reduce_mean(value, device):
 
 
 def wrap_ddp(model, device):
-    return DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
+    # gradient_as_bucket_view: grads live in the all-reduce buckets instead of a second fp32 copy (same math,
+    # saves 4 bytes per trainable param, ~2.4 GB for a 596M full fine-tune). The one change vs tiny-reasoner.
+    return DDP(model, device_ids=[device.index] if device.type == "cuda" else None, gradient_as_bucket_view=True)
 
 
 def unwrap(model):

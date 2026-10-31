@@ -20,6 +20,7 @@ PRUNE_DEFAULTS = dict(
     init="runs/align/final",            # phase-2 adapter or previous pruned stage; read only
     n_layers=14,                        # decoder layers kept, evenly spaced over the init's layers
     ffn_keep=0.75,                      # fraction of the init's FFN width kept in every layer
+    freeze_embeddings=False,            # True: token embeddings stay as in init (no grads / AdamW state: -12 B/param)
     dim=256,                            # must equal the init's head output and the teacher index dim
     query_prefix="",                    # must match phase 2
     max_query_len=32,
@@ -108,6 +109,8 @@ def train(rank, world_size, cfg, device):
     assert adapter_cfg["out_dim"] == cfg["dim"] == targets.shape[1], \
         f"init dim {adapter_cfg['out_dim']}, cfg dim {cfg['dim']}, teacher dim {targets.shape[1]}"
     model.requires_grad_(True)
+    if cfg["freeze_embeddings"]:  # Qwen3: 151k x 1024 = 155M of the 596M params
+        model.embed_tokens.requires_grad_(False)
     batch_loss = functools.partial(_align_batch_loss, tokenizer=tokenizer, texts=texts,
                                    targets=torch.from_numpy(targets.astype(np.float32)), loss_fn=l2_loss, cfg=cfg,
                                    device=device)
