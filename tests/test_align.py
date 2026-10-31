@@ -87,3 +87,31 @@ def test_align_resumes_from_latest_checkpoint(run):
     launch(align_main, cfg, nprocs=2)
     resumed = [r["step"] for r in read_log(cfg["out_dir"])[n_before:] if "train_loss" in r]
     assert resumed == [22, 24] and os.path.isdir(os.path.join(cfg["out_dir"], "final"))
+
+
+def test_grad_accum_matches_bigger_batch(run):
+    _, _, cfg = run
+    weights = []
+    for bs, accum in ((4, 1), (2, 2)):
+        out_dir = cfg["out_dir"] + f"_bs{bs}_accum{accum}"
+        launch(align_main, {**cfg, "lora_dropout": 0.0, "lr": 1e-3, "head_lr": 1e-3, "epochs": 1, "batch_size": bs,
+                            "grad_accum": accum, "eval_every": 0, "save_every": 0, "out_dir": out_dir}, nprocs=2)
+        assert [r["step"] for r in read_log(out_dir) if "train_loss" in r] == [2, 4, 6]  # 50 // 8 steps
+        weights.append(torch.load(os.path.join(out_dir, "final", ADAPTER_WEIGHTS)))
+    assert weights[0].keys() == weights[1].keys()
+    assert all(torch.allclose(weights[0][k], weights[1][k], atol=1e-5) for k in weights[0])
+
+
+def test_early_stop_keeps_best(run):
+    data, emb_dir, cfg = run
+    out_dir = cfg["out_dir"] + "_early_stop"
+    launch(align_main, {**cfg, "lr": 0.5, "head_lr": 0.5, "eval_every": 1, "patience": 1, "save_every": 0,
+                        "out_dir": out_dir}, nprocs=2)
+    val = [r for r in read_log(out_dir) if "val_loss" in r]
+    assert val[-1]["step"] < 24 and val[-1]["val_loss"] >= min(r["val_loss"] for r in val)  # stopped early
+    assert sorted(os.listdir(out_dir)) == ["final", "log.jsonl"]  # best/ renamed to final/, no step checkpoints
+    _, teacher_q = load_index(data, emb_dir, ("val",))
+    model, tok = load_encoder(os.path.join(out_dir, "final"), DEVICE)
+    q = encode(model, tok, data["val"]["texts"], DEVICE, DIM, 32).float()  # ALIGN_DEFAULTS max_query_len
+    best = l2_loss(q, torch.from_numpy(teacher_q["val"]).float()).item()
+    assert best == pytest.approx(min(r["val_loss"] for r in val), abs=1e-3)

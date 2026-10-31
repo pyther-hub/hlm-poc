@@ -4,6 +4,7 @@ DDP: one process per GPU, each takes its slice of every global batch; only the a
 Checkpoints are adapter-only (model.save_adapter): <out_dir>/step_<n>/ (+ trainer_state.pt, resumable) and
 <out_dir>/final/, which load_encoder / evaluate_model accept like a model dir.
 The training loop (run) and its helpers are shared with refine.py; each phase only supplies its batch loss."""
+import contextlib
 import functools
 import glob
 import json
@@ -39,13 +40,15 @@ ALIGN_DEFAULTS = dict(
     weight_decay=0.0,
     warmup_ratio=0.05,                  # linear warmup, then cosine decay to 0
     epochs=1,
-    batch_size=128,                     # per GPU; global batch = batch_size * world_size
+    batch_size=128,                     # per GPU; global batch = batch_size * world_size * grad_accum
+    grad_accum=1,                       # micro-batches per optimizer step
     grad_clip=1.0,
     amp=True,                           # fp16 autocast + GradScaler on CUDA (T4 has no bf16)
     seed=0,
     log_every=20,                       # steps; train loss averaged over ranks
     eval_every=200,                     # steps; val loss + retrieval on rank 0, 0 = only at the end
-    save_every=500,                     # steps; resumable adapter checkpoint
+    patience=0,                         # evals without a val_loss drop before stopping, best weights -> final; 0 = off
+    save_every=500,                     # steps; resumable adapter checkpoint, 0 = none
     keep_last=2,                        # step checkpoints kept
     data_path="cache/data.json",
     teacher_emb_dir="cache/emb/teacher",
@@ -158,11 +161,15 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
     batch_loss(ddp_model, global_idx, local, epoch) -> {"loss": tensor, other logged parts...}: global_idx is the
     whole global batch (same on every rank), global_idx[local] this rank's share. Each epoch is one seeded
     permutation; the ragged tail is dropped so every rank runs the same steps. Logs / evals / saves on rank 0;
-    resumes from the latest step checkpoint; writes <out_dir>/final at the end."""
+    resumes from the latest step checkpoint; writes <out_dir>/final at the end.
+    A step = grad_accum micro-batches of batch_size * world_size (gradients all-reduced on the last one only).
+    patience > 0: <out_dir>/best holds the lowest-val_loss weights, training stops after patience evals without an
+    improvement, and best becomes final."""
     body, head = trainable_params(model)  # LoRA + head, or every weight + head for a fully trained model
     params = body + head
-    bs = cfg["batch_size"]
-    per_step = bs * world_size
+    bs, accum = cfg["batch_size"], cfg["grad_accum"]
+    micro = bs * world_size
+    per_step = micro * accum
     steps_per_epoch = n_items // per_step
     total = steps_per_epoch * cfg["epochs"]
     assert total > 0, f"{n_items} examples < one global batch of {per_step}"
@@ -173,7 +180,8 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
     use_amp = cfg["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    step = 0
+    step, best, bad = 0, float("inf"), 0  # best val_loss so far, evals since it improved (rank 0)
+    best_dir = os.path.join(cfg["out_dir"], "best")
     ckpt = (step_checkpoints(cfg["out_dir"]) or [None])[-1]
     if ckpt:
         load_adapter_weights(model, ckpt)
@@ -181,7 +189,7 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
         opt.load_state_dict(state["opt"])
         sched.load_state_dict(state["sched"])
         scaler.load_state_dict(state["scaler"])
-        step = state["step"]
+        step, best, bad = state["step"], state.get("best", best), state.get("bad", bad)
     if is_main():
         n_params = sum(p.numel() for p in params)
         print(f"[{tag}] {n_items} examples, global batch {per_step}, {steps_per_epoch} steps/epoch, {total} steps, "
@@ -199,10 +207,15 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
             epoch = step // steps_per_epoch
             order = epoch_order(n_items, cfg["seed"], epoch)
         start = (step % steps_per_epoch) * per_step
-        with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
-            parts = batch_loss(ddp_model, order[start:start + per_step], local, epoch)
         opt.zero_grad(set_to_none=True)
-        scaler.scale(parts["loss"]).backward()
+        parts = {}  # mean over the micro-batches, detached, for logging
+        for k in range(accum):
+            with ddp_model.no_sync() if k < accum - 1 else contextlib.nullcontext():
+                with torch.autocast("cuda", dtype=torch.float16, enabled=use_amp):
+                    out = batch_loss(ddp_model, order[start + k * micro:start + (k + 1) * micro], local, epoch)
+                scaler.scale(out["loss"] / accum).backward()
+            for name, v in out.items():
+                parts[name] = parts.get(name, 0) + v.detach() / accum
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(params, cfg["grad_clip"])
         scaler.step(opt)
@@ -216,20 +229,39 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
                 log_row(cfg, tag, dict(step=step, epoch=epoch, **means, lr=sched.get_last_lr()[0],
                                        min=(time.perf_counter() - t0) / 60))
         if (cfg["eval_every"] and step % cfg["eval_every"] == 0) or step == total:
+            stop = 0.0
             if is_main():
-                log_row(cfg, tag, dict(step=step, **evaluate_val(model, tokenizer, val, cfg, device)))
+                row = evaluate_val(model, tokenizer, val, cfg, device)
+                log_row(cfg, tag, dict(step=step, **row))
+                if cfg["patience"]:
+                    if row["val_loss"] < best:
+                        best, bad = row["val_loss"], 0
+                        save_adapter(model, best_dir, adapter_cfg)
+                        print(f"[train] saved {best_dir} (val_loss {best:.4g})")
+                    else:
+                        bad += 1
+                    stop = float(bad >= cfg["patience"])
             else:
                 print(f"[rank{rank}] step {step}: waiting for rank 0 to evaluate", flush=True)
             barrier()
-        if step % cfg["save_every"] == 0 and step < total:
+            if reduce_mean(stop, device) > 0:  # every rank takes rank 0's decision
+                if is_main():
+                    print(f"[{tag}] early stop at step {step}: val_loss did not improve for {bad} evals "
+                          f"(best {best:.4g})")
+                break
+        if cfg["save_every"] and step % cfg["save_every"] == 0 and step < total:
             if is_main():
-                save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler)
+                save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler, best, bad)
             else:
                 print(f"[rank{rank}] step {step}: waiting for rank 0 to save", flush=True)
             barrier()
     if is_main():
-        save_adapter(model, os.path.join(cfg["out_dir"], "final"), adapter_cfg)
-        print(f"[{tag}] done: {cfg['out_dir']}/final")
+        final = os.path.join(cfg["out_dir"], "final")
+        if cfg["patience"] and os.path.exists(best_dir):  # missing only if no eval ever improved (e.g. NaN)
+            os.replace(best_dir, final)
+        else:
+            save_adapter(model, final, adapter_cfg)
+        print(f"[{tag}] done: {final}")
     print(f"[rank{rank}] training loop finished, waiting for all ranks", flush=True)
     barrier()
 
@@ -253,10 +285,10 @@ def evaluate_val(model, tokenizer, val, cfg, device):
             "val_recall@10": m["recall@10"], "val_cos": (q * val["teacher"]).sum(-1).mean().item()}
 
 
-def save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler):
+def save_checkpoint(model, adapter_cfg, cfg, step, opt, sched, scaler, best, bad):
     path = os.path.join(cfg["out_dir"], f"step_{step:07d}")
     save_adapter(model, path, adapter_cfg, dict(step=step, opt=opt.state_dict(), sched=sched.state_dict(),
-                                                 scaler=scaler.state_dict()))
+                                                 scaler=scaler.state_dict(), best=best, bad=bad))
     for p in step_checkpoints(cfg["out_dir"])[:-cfg["keep_last"]]:
         shutil.rmtree(p)
     print(f"[train] saved {path}")

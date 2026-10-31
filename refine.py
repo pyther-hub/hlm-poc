@@ -35,12 +35,14 @@ REFINE_DEFAULTS = dict(
     warmup_ratio=0.05,                  # linear warmup, then cosine decay to 0
     epochs=1,
     batch_size=64,                      # queries per GPU; docs per step = 2 * batch_size * world_size
+    grad_accum=1,                       # micro-batches per optimizer step; in-batch negatives stay per micro-batch
     grad_clip=1.0,
     amp=True,                           # fp16 autocast + GradScaler on CUDA
     seed=0,
     log_every=20,
     eval_every=200,                     # val L2/cos + val retrieval on rank 0, 0 = only at the end
-    save_every=500,
+    patience=0,                         # keep 0: val_loss is L2, not the CR objective (L2 rises while nDCG improves)
+    save_every=500,                     # 0 = no resumable step checkpoints
     keep_last=2,
     data_path="cache/data.json",
     teacher_emb_dir="cache/emb/teacher",
