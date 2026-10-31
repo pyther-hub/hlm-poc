@@ -115,3 +115,14 @@ def test_early_stop_keeps_best(run):
     q = encode(model, tok, data["val"]["texts"], DEVICE, DIM, 32).float()  # ALIGN_DEFAULTS max_query_len
     best = l2_loss(q, torch.from_numpy(teacher_q["val"]).float()).item()
     assert best == pytest.approx(min(r["val_loss"] for r in val), abs=1e-3)
+
+
+def test_full_align_with_frozen_embeddings(run, tiny_model_dir):
+    _, _, cfg = run
+    out_dir = cfg["out_dir"] + "_full_frozen_emb"
+    launch(align_main, {**cfg, "full": True, "freeze_embeddings": True, "epochs": 1, "eval_every": 0,
+                        "save_every": 0, "out_dir": out_dir}, nprocs=2)
+    base, _ = load_encoder(tiny_model_dir, DEVICE)
+    model, _ = load_encoder(os.path.join(out_dir, "final"), DEVICE)
+    assert torch.equal(model.embed_tokens.weight, base.embed_tokens.weight)
+    assert not torch.equal(model.layers[0].mlp.up_proj.weight, base.layers[0].mlp.up_proj.weight)

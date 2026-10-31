@@ -27,6 +27,7 @@ ALIGN_DEFAULTS = dict(
     model="Qwen/Qwen3-Embedding-0.6B",  # student base: hub id or local dir; frozen, fp32 (amp does the speed-up)
     dim=256,                            # head output = teacher index dim
     full=False,                         # True: no LoRA, train every base weight + head (lora_* ignored)
+    freeze_embeddings=False,            # full only: token embeddings stay pretrained (no grads / AdamW state)
     lora_rank=16,
     lora_alpha=32,                      # scale = alpha / rank
     lora_dropout=0.05,
@@ -113,6 +114,8 @@ def train(rank, world_size, cfg, device):
     if cfg["full"]:
         attach_head(model, cfg["dim"])
         model.requires_grad_(True)
+        if cfg["freeze_embeddings"]:  # Qwen3-0.6B: 155M of 596M params
+            model.get_input_embeddings().requires_grad_(False)
         adapter_cfg = dict(base=cfg["model"], out_dim=cfg["dim"], full=True)
     else:
         attach_adapter(model, cfg["lora_rank"], cfg["lora_alpha"], cfg["lora_dropout"], cfg["lora_targets"],

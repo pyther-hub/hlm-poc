@@ -281,6 +281,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `model` | `"Qwen/Qwen3-Embedding-0.6B"` | Student base, frozen, loaded fp32. |
 | `dim` | `256` | Head output = teacher index dim. |
 | `full` | `False` | `True`: no LoRA, every base weight + head trains (`lora_*` ignored; `lr` is then the base weights' lr). Notebook 05. |
+| `freeze_embeddings` | `False` | With `full`: the token embeddings stay pretrained (no grads / AdamW state; Qwen3-0.6B: 155M params, ~1.9 GB). |
 | `lora_rank`, `lora_alpha`, `lora_dropout` | `16`, `32`, `0.05` | LoRA scale = alpha / rank. |
 | `lora_targets` | `q,k,v,o,gate,up,down _proj` | Every linear in the decoder. |
 | `query_prefix`, `max_query_len` | `""`, `32` | Student queries. |
@@ -337,6 +338,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_adapter_starts_as_base_plus_head`, `test_adapter_checkpoint_roundtrip` | LoRA changing the model at init; checkpoints holding base weights or not reloading to the same vectors. |
 | `test_l2_loss_is_two_minus_two_cos` | Loss scale. |
 | `test_align_trains_and_keeps_last_checkpoints`, `test_align_resumes_from_latest_checkpoint` | 2-process alignment: loss goes down, `keep_last`, final adapter evaluates; a re-run resumes mid-run instead of restarting. |
+| `test_full_align_with_frozen_embeddings` | `full=True, freeze_embeddings=True` not freezing the embeddings or not training the rest. |
 | `test_freeze_embeddings_keeps_them_and_trains_the_rest` | `freeze_embeddings` not freezing them, or freezing more than them. |
 | `test_grad_accum_matches_bigger_batch`, `test_early_stop_keeps_best` | `grad_accum=2` at half the batch drifting from one big batch; early stop not stopping, leaving `best/` or step dirs, or `final/` not being the lowest-val_loss weights. |
 | `test_contrastive_loss_by_hand`, `test_contrastive_loss_masks_negatives_above_margin` | L_CR formula, known-positive masking, margin masking (a masked doc = an absent doc). |
