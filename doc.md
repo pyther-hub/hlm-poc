@@ -146,7 +146,10 @@ keep `n_layers` evenly spaced layers (first and last always) and `ffn_keep` of e
 `|gate_j|·|up_j|·|down_:,j|`; then train **every weight** + head with L2 on the align set (`align.run`). The
 checkpoint is an adapter dir with `full: true`, `keep_layers`, `ffn_idx` (indices into the hub base) and the whole
 state dict in `adapter.pt`; `load_encoder` rebuilds it from the base id. Progressive = chained stages; direct = one
-cut with `ffn_keep ** stages` so the final shape matches.
+cut with `ffn_keep ** stages` so the final shape matches. `layer_score="l2"` keeps the layers chosen greedily by
+calibration L2 instead of evenly spaced ones: drop the layer whose removal raises the L2 to the teacher on
+`calib_size` align queries least, re-score the rest, repeat (`l2_layers`). Rank 0 writes the choice and the L2 curve
+to `<out_dir>/prune_plan.json`; every rank reads it.
 
 **Corpus caveat:** the index is the positives + one stored negative of the core queries (~200k passages) plus 500k
 random passages of full MS MARCO, not all 8.8M, so absolute scores are higher than published ones. Use them to compare
@@ -236,7 +239,9 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | Function | What it does |
 |---|---|
 | `prune_main(rank, world_size, cfg)` | Worker for `launch(prune_main, PRUNE)`. `pruned_student`, unfreeze everything, L2 on the align set with `align.run`. Defaults in `PRUNE_DEFAULTS` (§4.6). |
-| `pruned_student(init, n_layers, ffn_keep, device)` | `(model, tokenizer, adapter_cfg)`: init adapter merged (LoRA) or loaded (pruned stage), cut, with indices relative to the hub base. |
+| `pruned_student(init, n_layers, ffn_keep, device, choose_layers=None)` | `(model, tokenizer, adapter_cfg)`: init adapter merged (LoRA) or loaded (pruned stage), cut, with indices relative to the hub base. Layers evenly spaced, or `choose_layers(model, tokenizer)`. |
+| `l2_layers(model, n, batches, dim)` | Greedy L2-aware layer choice → `(kept, dropped in order, calib L2 after each drop)`. `calib_l2(model, batches, dim)`: mean L2 to the teacher over `(input_ids, attention_mask, teacher)` batches. `only_layers(model, keep)`: context manager running only those layers. |
+| `planned_layers(model, tokenizer, cfg, texts, targets, device)` | `layer_score="l2"`: rank 0 runs `l2_layers` on `calib_batches(...)` and writes `<out_dir>/prune_plan.json` (reused if present); every rank returns its `keep`. |
 | `select_layers(n, k)`, `ffn_scores(mlp)`, `top_neurons(mlp, k)` | Evenly spaced layers (first, last kept); per-neuron `|gate_j|·|up_j|·|down_:,j|`; the top k, sorted. |
 
 ### `run_exp.py`
@@ -311,7 +316,8 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | Key | Default | Meaning |
 |---|---|---|
 | `init` | `"runs/align/final"` | Phase-2 adapter or a previous pruned stage; read only. |
-| `n_layers`, `ffn_keep` | `14`, `0.75` | Layers kept (evenly spaced over the init's); fraction of the init's FFN width kept. |
+| `n_layers`, `ffn_keep` | `14`, `0.75` | Layers kept from the init's; fraction of the init's FFN width kept. |
+| `layer_score`, `calib_size` | `"even"`, `1024` | Which layers: `"even"` = evenly spaced (first, last kept); `"l2"` = greedy by calibration L2 on `calib_size` align queries (seeded by `seed`). |
 | `freeze_embeddings` | `False` | `True`: the token embeddings keep the init's values (no grads / AdamW state; Qwen3: 155M params, ~1.9 GB on a full fine-tune). |
 | `dim`, `query_prefix`, `max_query_len` | `256`, `""`, `32` | Must match phase 2 / the teacher index. |
 | `lr`, `head_lr`, `weight_decay`, `warmup_ratio` | `2e-5`, `1e-4`, `0.0`, `0.05` | AdamW over every weight / the head; warmup then cosine to 0. |
@@ -347,6 +353,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_select_layers`, `test_prune_keep_all_is_identity`, `test_ffn_pruning_drops_dead_neurons` | Layer choice; surgery that changes outputs when it shouldn't; neuron scores / slicing. |
 | `test_merge_lora_matches_hooks`, `test_pruned_checkpoint_roundtrip_and_chain`, `test_full_model_trains_every_weight` | Merged LoRA ≠ hooked LoRA; full checkpoints not reloading; progressive indices not relative to the base; frozen weights in a full fine-tune. |
 | `test_prune_main_trains_pruned_student`, `test_refine_trains_pruned_student` | 2-process pruning trains and saves a 1-layer full checkpoint; CR on it trains. |
+| `test_l2_layers_drops_an_identity_layer_and_restores_the_model`, `test_prune_main_l2_layer_score_keeps_the_planned_layers` | Greedy L2 not dropping a layer that adds nothing, or leaving the model changed; `final/` not keeping the layers in `prune_plan.json`. |
 | `test_lora_trainable_params_match_adapter_params`, `test_evaluate_runs_adds_teacher_and_resumes` | LoRA optimizer groups changed (breaks resume); finished rows re-evaluated; plots. |
 | `test_bert_cls_pooling_ignores_padding`, `test_bert_head_on_last_layernorm` | BERT left-padded (shifts absolute positions) or pooled from the wrong token; head not on the final hidden states. |
 | `test_full_align_trains_every_weight`, `test_refine_from_full_bert` | 2-process `full=True` alignment of a tiny BERT: base weights move, the checkpoint is the full state dict without LoRA; CR from it trains and evaluates. |

@@ -11,8 +11,8 @@ from conftest import build_teacher_index, tiny_rows
 from data import build_data, save_json
 from ddp import launch
 from model import (ADAPTER_CONFIG, attach_adapter, encode, load_encoder, merge_lora, prune_model, save_adapter,
-                   trainable_params)
-from prune import ffn_scores, prune_main, pruned_student, select_layers
+                   tokenize, trainable_params)
+from prune import calib_l2, ffn_scores, l2_layers, prune_main, pruned_student, select_layers
 from refine import refine_main
 
 DEVICE = torch.device("cpu")
@@ -97,6 +97,23 @@ def test_full_model_trains_every_weight(tiny_model_dir, tmp_path):
     assert len(head) == 2 and sum(p.numel() for p in body + head) == sum(p.numel() for p in model.parameters())
 
 
+def test_l2_layers_drops_an_identity_layer_and_restores_the_model(tiny_model_dir):
+    """Layer 0 with o_proj and down_proj zeroed adds nothing to the residual: greedy L2 drops it first, at no cost."""
+    model, tok = load_encoder(tiny_model_dir, DEVICE)
+    with torch.no_grad():
+        model.layers[0].self_attn.o_proj.weight.zero_()
+        model.layers[0].mlp.down_proj.weight.zero_()
+    before = vecs(model, tok)
+    enc = tokenize(tok, TEXTS, 16)
+    batches = [(enc["input_ids"], enc["attention_mask"], before)]  # teacher = the model itself: L2 starts at 0
+    keep, dropped, curve = l2_layers(model, 1, batches, DIM)
+    assert keep == [1] and dropped == [0] and curve == pytest.approx([0.0, 0.0], abs=1e-6)
+    assert len(model.layers) == model.config.num_hidden_layers == 2
+    assert [l.self_attn.layer_idx for l in model.layers] == [0, 1]
+    assert torch.allclose(vecs(model, tok), before)
+    assert calib_l2(model, batches, DIM) == pytest.approx(0.0, abs=1e-6)
+
+
 @pytest.fixture(scope="module")
 def run(tmp_path_factory, tiny_model_dir):
     """Tiny teacher index and a LoRA adapter, then 2-process pruning to 1 layer, then refinement of that student."""
@@ -125,6 +142,17 @@ def test_prune_main_trains_pruned_student(run):
     assert cfg["full"] and cfg["keep_layers"] == [0] and len(cfg["ffn_idx"][0]) == 64
     model, _ = load_encoder(os.path.join(prune_cfg["out_dir"], "final"), DEVICE)
     assert len(model.layers) == 1
+
+
+def test_prune_main_l2_layer_score_keeps_the_planned_layers(run):
+    prune_cfg, _ = run
+    out_dir = prune_cfg["out_dir"] + "_l2"
+    launch(prune_main, {**prune_cfg, "layer_score": "l2", "calib_size": 8, "epochs": 1, "out_dir": out_dir}, nprocs=2)
+    with open(os.path.join(out_dir, "prune_plan.json")) as f:
+        plan = json.load(f)
+    assert len(plan["keep"]) == 1 and len(plan["dropped"]) == 1 and len(plan["calib_l2"]) == 2
+    with open(os.path.join(out_dir, "final", ADAPTER_CONFIG)) as f:
+        assert json.load(f)["keep_layers"] == plan["keep"]  # the init is the unpruned base: same indices
 
 
 def test_refine_trains_pruned_student(run):
