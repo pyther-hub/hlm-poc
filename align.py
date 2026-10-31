@@ -48,7 +48,8 @@ ALIGN_DEFAULTS = dict(
     seed=0,
     log_every=20,                       # steps; train loss averaged over ranks
     eval_every=200,                     # steps; val loss + retrieval on rank 0, 0 = only at the end
-    patience=0,                         # evals without a val_loss drop before stopping, best weights -> final; 0 = off
+    patience=0,                         # evals without a stop_on improvement before stopping, best weights -> final; 0 = off
+    stop_on="val_loss",                 # eval metric patience watches: val_loss is minimised, any other val_* maximised
     save_every=500,                     # steps; resumable adapter checkpoint, 0 = none
     keep_last=2,                        # step checkpoints kept
     data_path="cache/data.json",
@@ -166,8 +167,8 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
     permutation; the ragged tail is dropped so every rank runs the same steps. Logs / evals / saves on rank 0;
     resumes from the latest step checkpoint; writes <out_dir>/final at the end.
     A step = grad_accum micro-batches of batch_size * world_size (gradients all-reduced on the last one only).
-    patience > 0: <out_dir>/best holds the lowest-val_loss weights, training stops after patience evals without an
-    improvement, and best becomes final."""
+    patience > 0: <out_dir>/best holds the best weights by cfg["stop_on"] (lowest val_loss, highest of any other val
+    metric), training stops after patience evals without an improvement, and best becomes final."""
     body, head = trainable_params(model)  # LoRA + head, or every weight + head for a fully trained model
     params = body + head
     bs, accum = cfg["batch_size"], cfg["grad_accum"]
@@ -183,7 +184,9 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
     use_amp = cfg["amp"] and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    step, best, bad = 0, float("inf"), 0  # best val_loss so far, evals since it improved (rank 0)
+    key = cfg["stop_on"]
+    sign = 1 if key == "val_loss" else -1  # compare sign * metric: lower is better
+    step, best, bad = 0, float("inf"), 0  # best sign * metric so far, evals since it improved (rank 0)
     best_dir = os.path.join(cfg["out_dir"], "best")
     ckpt = (step_checkpoints(cfg["out_dir"]) or [None])[-1]
     if ckpt:
@@ -237,10 +240,10 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
                 row = evaluate_val(model, tokenizer, val, cfg, device)
                 log_row(cfg, tag, dict(step=step, **row))
                 if cfg["patience"]:
-                    if row["val_loss"] < best:
-                        best, bad = row["val_loss"], 0
+                    if sign * row[key] < best:
+                        best, bad = sign * row[key], 0
                         save_adapter(model, best_dir, adapter_cfg)
-                        print(f"[train] saved {best_dir} (val_loss {best:.4g})")
+                        print(f"[train] saved {best_dir} ({key} {row[key]:.4g})")
                     else:
                         bad += 1
                     stop = float(bad >= cfg["patience"])
@@ -254,8 +257,8 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
                 torch.cuda.reset_peak_memory_stats(device)
             if reduce_mean(stop, device) > 0:  # every rank takes rank 0's decision
                 if is_main():
-                    print(f"[{tag}] early stop at step {step}: val_loss did not improve for {bad} evals "
-                          f"(best {best:.4g})")
+                    print(f"[{tag}] early stop at step {step}: {key} did not improve for {bad} evals "
+                          f"(best {sign * best:.4g})")
                 break
         if cfg["save_every"] and step % cfg["save_every"] == 0 and step < total:
             if is_main():

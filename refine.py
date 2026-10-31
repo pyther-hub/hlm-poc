@@ -41,7 +41,8 @@ REFINE_DEFAULTS = dict(
     seed=0,
     log_every=20,
     eval_every=200,                     # val L2/cos + val retrieval on rank 0, 0 = only at the end
-    patience=0,                         # keep 0: val_loss is L2, not the CR objective (L2 rises while nDCG improves)
+    patience=0,                         # evals without a stop_on improvement before stopping, best weights -> final; 0 = off
+    stop_on="val_ndcg@10",              # not val_loss: that is L2, which rises while CR improves nDCG
     save_every=500,                     # 0 = no resumable step checkpoints
     keep_last=2,
     data_path="cache/data.json",

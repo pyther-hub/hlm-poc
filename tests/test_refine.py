@@ -99,3 +99,16 @@ def test_refine_with_mined_negatives(run):
     train = [r for r in read_log(cfg["out_dir"]) if "train_loss" in r]
     assert len(train) == 1 and all(map(math.isfinite, (train[0]["cr"], train[0]["l2"])))
     assert os.path.exists(os.path.join(cfg["out_dir"], "final"))
+
+
+def test_refine_early_stop_keeps_best_ndcg(run):
+    data, emb_dir, cfg, _ = run
+    cfg = {**cfg, "lr": 0.5, "head_lr": 0.5, "eval_every": 1, "patience": 1, "save_every": 0,
+           "out_dir": cfg["out_dir"] + "_early_stop"}
+    launch(refine_main, cfg, nprocs=2)
+    val = [r for r in read_log(cfg["out_dir"]) if "val_ndcg@10" in r]
+    assert val[-1]["step"] < 12 and val[-1]["val_ndcg@10"] <= max(r["val_ndcg@10"] for r in val)  # stopped early
+    assert sorted(os.listdir(cfg["out_dir"])) == ["final", "log.jsonl"]  # best/ renamed to final/
+    docs, _ = load_index(data, emb_dir, ("val",))
+    result = evaluate_model(os.path.join(cfg["out_dir"], "final"), data, docs, ("val",), DIM, dtype="fp32")
+    assert result["val"]["ndcg@10"] == pytest.approx(max(r["val_ndcg@10"] for r in val), abs=1e-4)

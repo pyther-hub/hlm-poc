@@ -41,7 +41,8 @@ PRUNE_DEFAULTS = dict(
     seed=0,
     log_every=20,
     eval_every=200,                     # val L2/cos + val retrieval on rank 0, 0 = only at the end
-    patience=0,                         # evals without a val_loss drop before stopping, best weights -> final; 0 = off
+    patience=0,                         # evals without a stop_on improvement before stopping, best weights -> final; 0 = off
+    stop_on="val_loss",                 # as in ALIGN_DEFAULTS
     save_every=500,                     # 0 = no resumable step checkpoints
     keep_last=2,
     data_path="cache/data.json",
