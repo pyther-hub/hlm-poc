@@ -169,10 +169,11 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 ### `model.py`
 | Function | What it does |
 |---|---|
-| `load_encoder(name, device, dtype=fp32, device_map=None)` | `name` = hub id, local dir, or adapter dir (→ `load_adapter`). Returns a frozen, eval-mode `(model, tokenizer)`. `AutoModel` with sdpa. A missing local dir raises `FileNotFoundError`. `device_map="auto"` spreads a model over GPUs. |
-| `is_bert(model)` | BERT-style encoder (`config.model_type == "bert"`, e.g. bge-small; DDP-wrapped ok). For it `load_encoder` sets right padding and drops the unused pooler, `embed` uses CLS pooling, `attach_head` hooks the last layer's output LayerNorm. Derived from the model, not a cfg knob: fixed by pretraining. |
+| `load_encoder(name, device, dtype=fp32, device_map=None)` | `name` = hub id, local dir, or adapter dir (→ `load_adapter`). Returns a frozen, eval-mode `(model, tokenizer)`. `AutoModel` with sdpa. A missing local dir raises `FileNotFoundError`. `device_map="auto"` spreads a model over GPUs. Sets `model.pooling = read_pooling(name, model)` (an adapter dir gets its base's). |
+| `is_bert(model)` | BERT-style encoder (`config.model_type` `"bert"`, e.g. bge / e5, or `"modernbert"`, e.g. DenseOn / granite r2; DDP-wrapped ok). For it `load_encoder` sets right padding and drops the unused pooler (BERT), and `read_pooling` falls back to CLS. |
+| `read_pooling(name, model)` | `"cls"` / `"mean"` / `"last"` from the model's own sentence-transformers `1_Pooling/config.json` (local dir or hub): Qwen3-Embedding → last, bge / DenseOn / granite r2 → CLS, e5 → mean. No such file: CLS for `is_bert`, else last token. Offline without the file cached raises; an unsupported mode (weightedmean, several modes) raises. Derived from the model, not a cfg knob: fixed by pretraining. |
 | `tokenize(tokenizer, texts, max_length, prefix="")` | Padded batch (left for Qwen, right for BERT) ending in end-of-text / `[SEP]` (appended if the tokenizer adds neither). |
-| `pool_last_token(hidden, mask)` / `truncate_normalize(x, dim)` / `embed(model, ids, mask, dim)` | Last-token pooling (any padding side) / MRL truncate + L2 / both after a forward (CLS instead of last token for BERT). |
+| `pool_last_token(hidden, mask)` / `pool_mean(hidden, mask)` / `truncate_normalize(x, dim)` / `embed(model, ids, mask, dim)` | Last-token pooling (any padding side) / masked mean (fp32) / MRL truncate + L2 / forward, pool by `model.pooling` (CLS = token 0), truncate + L2. |
 | `encode(model, tokenizer, texts, device, dim, max_length, prefix="", batch_size=64, amp=True, progress=False)` | No-grad, length-sorted batches; fp16 CPU tensor `[N, dim]` in input order. `progress=True`: a `[encode cuda:0] b/n batches  elapsed  eta` line every ~1% (rank 0 only, labelled with the device), plain prints so they show from spawned workers. |
 | `get_device()`, `DTYPES` | `cuda:0` or CPU; `"fp32"/"fp16"/"bf16"` → torch dtype. |
 | `gpu_mem(device)` | `" (free/total GB free)"` on a CUDA device, counting every process on it; `""` on CPU. For the `[rank N]` step lines. |
@@ -213,7 +214,7 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | Function | What it does |
 |---|---|
 | `attach_adapter(model, rank, alpha, dropout, targets, out_dim)` | LoRA (A Kaiming, B zero) on every `nn.Linear` named in `targets` + `align_head` Linear(hidden → out_dim) after the final norm. Hooks, no wrapper modules. |
-| `attach_head(model, out_dim)` | Just the `align_head` (used by `attach_adapter` and by fully trained models), on the final norm (Qwen) or the last layer's output LayerNorm (BERT). |
+| `attach_head(model, out_dim)` | Just the `align_head` (used by `attach_adapter` and by fully trained models), on the final norm (Qwen `norm`, ModernBERT `final_norm`) or the last layer's output LayerNorm (BERT). |
 | `adapter_params(model)` | `(lora params, head params)`. |
 | `trainable_params(model)` | `(body, head)` among `requires_grad` params; body = LoRA for a frozen base, every weight for a full model. `align.run`'s optimizer groups. |
 | `merge_lora(model, path)` | Fold an adapter dir's LoRA into the base weights (`W += α/r · B A`) and attach its head; no hooks. |
@@ -358,6 +359,8 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_l2_layers_drops_an_identity_layer_and_restores_the_model`, `test_prune_main_l2_layer_score_keeps_the_planned_layers` | Greedy L2 not dropping a layer that adds nothing, or leaving the model changed; `final/` not keeping the layers in `prune_plan.json`. |
 | `test_lora_trainable_params_match_adapter_params`, `test_evaluate_runs_adds_teacher_and_resumes` | LoRA optimizer groups changed (breaks resume); finished rows re-evaluated; plots. |
 | `test_bert_cls_pooling_ignores_padding`, `test_bert_head_on_last_layernorm` | BERT left-padded (shifts absolute positions) or pooled from the wrong token; head not on the final hidden states. |
+| `test_modernbert_cls_pooling_head_on_final_norm_and_every_weight_trains` | ModernBERT left-padded / not CLS-pooled, head not on `final_norm`, or a weight without a gradient (DDP would hang). |
+| `test_pooling_read_from_sentence_transformers_config` | A `1_Pooling/config.json` asking for mean pooling ignored (e5 pooled from CLS), or mean pooling counts padding. |
 | `test_full_align_trains_every_weight`, `test_refine_from_full_bert` | 2-process `full=True` alignment of a tiny BERT: base weights move, the checkpoint is the full state dict without LoRA; CR from it trains and evaluates. |
 | `test_expected_notebooks`, `test_notebook_clean_and_compiles` | Stray notebooks, stored outputs, syntax errors. |
 

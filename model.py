@@ -8,6 +8,8 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
 from transformers import AutoModel, AutoTokenizer
 
 from ddp import is_main
@@ -49,14 +51,41 @@ def load_encoder(name, device, dtype=torch.float32, device_map=None):
         tokenizer.padding_side = "right"
     if getattr(model, "pooler", None) is not None:  # BERT's pooler is never used (and has no grad under DDP)
         model.pooler = None
+    model.pooling = read_pooling(name, model)
     model.requires_grad_(False)
     #this is the base mdoel hence graident is off for all parameters and lora is attached to the model for training
     return model.eval(), tokenizer
 
 
 def is_bert(model):
-    """BERT-style encoder (e.g. bge-small): CLS pooling, right padding. model may be DDP-wrapped."""
-    return getattr(model, "module", model).config.model_type == "bert"
+    """BERT-style encoder (BERT e.g. bge-small / e5, ModernBERT e.g. DenseOn / granite r2): absolute positions or
+    trained with right padding, so it is padded on the right. model may be DDP-wrapped."""
+    return getattr(model, "module", model).config.model_type in ("bert", "modernbert")
+
+
+POOLING_MODES = {"pooling_mode_cls_token": "cls", "pooling_mode_mean_tokens": "mean", "pooling_mode_lasttoken": "last"}
+
+
+def read_pooling(name, model):
+    """"cls" | "mean" | "last": the model's own sentence-transformers pooling (<name>/1_Pooling/config.json, local
+    dir or hub). Without that file: CLS for BERT-style models, else last token."""
+    if os.path.isdir(os.path.expanduser(name)):
+        path = os.path.join(os.path.expanduser(name), "1_Pooling", "config.json")
+    else:
+        try:
+            path = hf_hub_download(name, "1_Pooling/config.json")
+        except EntryNotFoundError as e:  # repo without the file; offline + not cached still raises
+            if isinstance(e, LocalEntryNotFoundError):
+                raise
+            path = ""
+    if not os.path.isfile(path):
+        return "cls" if is_bert(model) else "last"
+    with open(path) as f:
+        cfg = json.load(f)
+    on = [k for k, v in cfg.items() if k.startswith("pooling_mode_") and v]
+    if len(on) != 1 or on[0] not in POOLING_MODES:
+        raise ValueError(f"{name}: unsupported pooling {on}")
+    return POOLING_MODES[on[0]]
 
 
 def tokenize(tokenizer, texts, max_length, prefix=""):
@@ -68,6 +97,11 @@ def tokenize(tokenizer, texts, max_length, prefix=""):
         return tokenizer(texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
     ids = tokenizer(texts, truncation=True, max_length=max_length - 1)["input_ids"]
     return tokenizer.pad({"input_ids": [x + [tokenizer.pad_token_id] for x in ids]}, return_tensors="pt")
+
+
+def pool_mean(hidden, attention_mask):
+    mask = attention_mask.unsqueeze(-1).float()
+    return (hidden.float() * mask).sum(1) / mask.sum(1)
 
 
 def pool_last_token(hidden, attention_mask):
@@ -83,7 +117,13 @@ def truncate_normalize(x, dim):
 
 def embed(model, input_ids, attention_mask, dim):
     hidden = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-    pooled = hidden[:, 0] if is_bert(model) else pool_last_token(hidden, attention_mask)  # BERT: CLS
+    pooling = getattr(model, "module", model).pooling  # set by load_encoder
+    if pooling == "cls":
+        pooled = hidden[:, 0]
+    elif pooling == "mean":
+        pooled = pool_mean(hidden, attention_mask)
+    else:
+        pooled = pool_last_token(hidden, attention_mask)
     return truncate_normalize(pooled, dim)
 
 
@@ -150,8 +190,13 @@ def attach_adapter(model, rank, alpha, dropout, targets, out_dim):
 
 def attach_head(model, out_dim):
     """Linear(hidden -> out_dim) on the final norm's output, so model(...).last_hidden_state is out_dim wide.
-    BERT has no final norm: the last layer's output LayerNorm (nothing reads it after that, the pooler is removed)."""
-    norm = model.encoder.layer[-1].output.LayerNorm if is_bert(model) else model.norm
+    BERT has no final norm: the last layer's output LayerNorm (nothing reads it after that, the pooler is removed).
+    ModernBERT's is final_norm."""
+    model_type = model.config.model_type
+    if model_type == "bert":
+        norm = model.encoder.layer[-1].output.LayerNorm
+    else:
+        norm = model.final_norm if model_type == "modernbert" else model.norm
     w = norm.weight
     model.align_head = nn.Linear(model.config.hidden_size, out_dim, dtype=w.dtype, device=w.device)
     norm.register_forward_hook(functools.partial(_head_hook, model.align_head))

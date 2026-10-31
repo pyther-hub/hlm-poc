@@ -1,5 +1,6 @@
-"""BERT student (bge-small architecture): right padding + CLS pooling, the head on the last LayerNorm, and a full
-fine-tune (align full=True) on 2 CPU processes followed by contrastive refinement of every weight."""
+"""BERT-style students (bge / e5: BERT, DenseOn / granite r2: ModernBERT): right padding, the model's own pooling,
+the head on the last LayerNorm / final_norm, and a full fine-tune (align full=True) on 2 CPU processes followed by
+contrastive refinement of every weight."""
 import os
 
 import pytest
@@ -37,6 +38,36 @@ def test_bert_head_on_last_layernorm(tiny_bert_dir):
     base = model(**enc).last_hidden_state
     attach_head(model, DIM)
     assert torch.allclose(model(**enc).last_hidden_state, model.align_head(base), atol=1e-6)
+
+
+def test_modernbert_cls_pooling_head_on_final_norm_and_every_weight_trains(tiny_modernbert_dir):
+    model, tok = load_encoder(tiny_modernbert_dir, DEVICE)
+    assert tok.padding_side == "right" and model.pooling == "cls"
+    enc = tokenize(tok, ["river city", "gold tax moon salt king rain"], 16)
+    hidden = model(**enc).last_hidden_state
+    assert torch.allclose(embed(model, enc["input_ids"], enc["attention_mask"], 64), F.normalize(hidden[:, 0]))
+    alone = encode(model, tok, ["river city"], DEVICE, 64, 16)
+    batched = encode(model, tok, ["river city", "gold tax moon salt king rain bank code"], DEVICE, 64, 16)
+    assert torch.allclose(alone[0].float(), batched[0].float(), atol=1e-3)
+    attach_head(model, DIM)
+    assert torch.allclose(model(**enc).last_hidden_state, model.align_head(hidden), atol=1e-6)
+    model.requires_grad_(True)
+    embed(model, enc["input_ids"], enc["attention_mask"], DIM).sum().backward()
+    assert all(p.grad is not None for p in model.parameters())  # an unused weight would hang DDP
+
+
+def test_pooling_read_from_sentence_transformers_config(tiny_mean_bert_dir, tiny_bert_dir):
+    assert load_encoder(tiny_bert_dir, DEVICE)[0].pooling == "cls"  # no 1_Pooling/: BERT falls back to CLS
+    model, tok = load_encoder(tiny_mean_bert_dir, DEVICE)
+    assert model.pooling == "mean"
+    enc = tokenize(tok, ["river city", "gold tax moon salt king rain"], 16)
+    hidden = model(**enc).last_hidden_state
+    mask = enc["attention_mask"].unsqueeze(-1).float()
+    assert torch.allclose(embed(model, enc["input_ids"], enc["attention_mask"], 64),
+                          F.normalize((hidden * mask).sum(1) / mask.sum(1)), atol=1e-6)
+    alone = encode(model, tok, ["river city"], DEVICE, 64, 16)
+    batched = encode(model, tok, ["river city", "gold tax moon salt king rain bank code"], DEVICE, 64, 16)
+    assert torch.allclose(alone[0].float(), batched[0].float(), atol=1e-3)
 
 
 @pytest.fixture(scope="module")

@@ -1,4 +1,6 @@
+import json
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -44,23 +46,56 @@ def tiny_model_dir(tmp_path_factory):
     return path
 
 
-@pytest.fixture(scope="session")
-def tiny_bert_dir(tmp_path_factory):
-    """2-layer, hidden-64 random BERT (the bge-small architecture) + a WordPiece tokenizer over tiny_rows' words,
-    built from a vocab file (no download), saved as a plain model dir."""
-    from transformers import BertConfig, BertModel, BertTokenizerFast
-    path = str(tmp_path_factory.mktemp("tiny_bert"))
+def save_tiny_wordpiece(path):
+    """A WordPiece tokenizer over tiny_rows' words, built from a vocab file (no download), saved into path."""
+    from transformers import BertTokenizerFast
     words = "river city music cell gold tax moon salt king rain bank code lake film bird wave".split()
     digits = [str(i) for i in range(10)]
     vocab = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", "-"] + words + digits + ["##" + d for d in digits]
     with open(os.path.join(path, "vocab.txt"), "w") as f:
         f.write("\n".join(vocab) + "\n")
     tokenizer = BertTokenizerFast(vocab_file=os.path.join(path, "vocab.txt"))
-    config = BertConfig(vocab_size=len(vocab), hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+    tokenizer.save_pretrained(path)
+    return tokenizer
+
+
+@pytest.fixture(scope="session")
+def tiny_bert_dir(tmp_path_factory):
+    """2-layer, hidden-64 random BERT (the bge-small architecture) + the tiny WordPiece tokenizer, saved as a plain
+    model dir."""
+    from transformers import BertConfig, BertModel
+    path = str(tmp_path_factory.mktemp("tiny_bert"))
+    tokenizer = save_tiny_wordpiece(path)
+    config = BertConfig(vocab_size=len(tokenizer), hidden_size=64, intermediate_size=128, num_hidden_layers=2,
                         num_attention_heads=4, max_position_embeddings=64)
     torch.manual_seed(0)
     BertModel(config).save_pretrained(path)
-    tokenizer.save_pretrained(path)
+    return path
+
+
+@pytest.fixture(scope="session")
+def tiny_mean_bert_dir(tmp_path_factory, tiny_bert_dir):
+    """tiny_bert_dir + a sentence-transformers 1_Pooling/config.json asking for mean pooling (as e5-base-v2)."""
+    path = str(tmp_path_factory.mktemp("tiny_mean_bert"))
+    shutil.copytree(tiny_bert_dir, path, dirs_exist_ok=True)
+    os.makedirs(os.path.join(path, "1_Pooling"))
+    with open(os.path.join(path, "1_Pooling", "config.json"), "w") as f:
+        json.dump({"pooling_mode_cls_token": False, "pooling_mode_mean_tokens": True}, f)
+    return path
+
+
+@pytest.fixture(scope="session")
+def tiny_modernbert_dir(tmp_path_factory):
+    """2-layer, hidden-64 random ModernBERT (the DenseOn / granite r2 architecture) + the tiny WordPiece tokenizer."""
+    from transformers import ModernBertConfig, ModernBertModel
+    path = str(tmp_path_factory.mktemp("tiny_modernbert"))
+    tokenizer = save_tiny_wordpiece(path)
+    config = ModernBertConfig(vocab_size=len(tokenizer), hidden_size=64, intermediate_size=96, num_hidden_layers=2,
+                              num_attention_heads=4, max_position_embeddings=64, pad_token_id=tokenizer.pad_token_id,
+                              cls_token_id=tokenizer.cls_token_id, sep_token_id=tokenizer.sep_token_id,
+                              bos_token_id=tokenizer.cls_token_id, eos_token_id=tokenizer.sep_token_id)
+    torch.manual_seed(0)
+    ModernBertModel(config).save_pretrained(path)
     return path
 
 
