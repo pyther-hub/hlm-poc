@@ -11,12 +11,11 @@ A small student query encoder (Qwen3-Embedding-0.6B) retrieves against a frozen 
 | 02 | [02-student-alignment-and-pruning](https://www.kaggle.com/code/tensorpanda231/02-student-alignment-and-pruning) | [02_student_alignment_and_pruning.ipynb](notebooks/02_student_alignment_and_pruning.ipynb) | align the 0.6B student to teacher query vectors, prune 28 → 14 → 7 layers with re-alignment |
 | 03 | [03-contrastive-refinement](https://www.kaggle.com/code/tensorpanda231/03-contrastive-refinement) | [03_contrastive_refinement.ipynb](notebooks/03_contrastive_refinement.ipynb) | contrastive refinement of every student against the frozen teacher doc vectors |
 | 04 | [04-retrieval-evaluation-and-ablation](https://www.kaggle.com/code/tensorpanda231/04-retrieval-evaluation-and-ablation) | [04_retrieval_evaluation_and_ablation.ipynb](notebooks/04_retrieval_evaluation_and_ablation.ipynb) | evaluate all variants on test, efficiency, ablations |
+| 05 | [05-bge-small-align-and-refine](https://www.kaggle.com/code/tensorpanda231/05-bge-small-align-and-refine) | [05_bge_small_align_and_refine.ipynb](notebooks/05_bge_small_align_and_refine.ipynb) | BGE students (small / base / large): full fine-tune align + contrastive refinement |
 
 Local copies of the Kaggle runs, with outputs, are kept in `notebooks/kaggle_runs/` (gitignored).
 
 ## Setup as run
-
-Full mode (`DEBUG=False`), Kaggle GPU T4 x2.
 
 - Corpus: 299,985 passages (positives + one stored negative per core query + 100k random distractors).
 - Queries: val 5,000, test 5,000, alignment 200k (train + other, never val/test), refinement 90k (train).
@@ -29,7 +28,6 @@ Full mode (`DEBUG=False`), Kaggle GPU T4 x2.
 | prune 14→7 + re-align (full fine-tune) | 200k queries | 1 | 64 (128) | 2e-5 / 1e-4 | 265.69M |
 | contrastive refinement, n_neg=3, margin=0.2 | 90k queries | 1 | 96 (192) | 5e-5 / 1e-4 | as above per student |
 
-- Kept layers: `prog_l14` = `[0, 2, 4, 6, 8, 10, 12, 15, 17, 19, 21, 23, 25, 27]`, `prog_l7` = `[0, 4, 8, 12, 19, 23, 27]`.
 - Refinement ran with `n_neg=3, margin=0.2`; the repo defaults are `n_neg=1, margin=0.1`.
 
 ## Results
@@ -114,12 +112,94 @@ Speedup vs teacher_4b (ms/query ratio):
 
 **Observations:**
 
-## Open items to check
+## BGE students (notebook 05)
 
-- 03's own evaluation of the `_cr` models on test differs from 04's re-evaluation (aligned_cr nDCG@10 0.7306 in 03
-  vs 0.7276 in 04; prog_l7_cr 0.6015 vs 0.6077, R@100 0.9377 vs 0.9424). This README reports 04's numbers.
-- 04's ablation markdown mentions "untrained student (own index) → aligned", but the cell doesn't compute it.
-- The Kaggle copy of notebook 01 has no saved outputs; the teacher row comes from 02 / 04.
+Kaggle run: [05-bge-small-align-and-refine](https://www.kaggle.com/code/tensorpanda231/05-bge-small-align-and-refine).
+Local copies: `notebooks/kaggle_runs_final/bge-runs/05-bge-{small,base,large}-align-and-refine.ipynb`.
+Same teacher index, data and eval as above. Student = `BAAI/bge-*-en-v1.5`, CLS pooling, linear head → 256,
+**full fine-tune** (no LoRA, no pruning), `QUERY_PREFIX=""`. Two stages: align (L2), then contrastive refinement
+(`tau=0.05, margin=0.1, n_neg=1, l2_weight=0.1`).
+
+### Setup as run
+
+| student | params | align: epochs / global batch / lr / head_lr | align steps | refine: epochs / global batch / lr / head_lr | refine steps | align min | refine min |
+|---|---|---|---|---|---|---|---|
+| bge-small | 33.31M | 20 / 2048 / 1e-4 / 3e-4 | 1940 | 20 / 2048 / 3e-5 / 3e-5 | 860 | 17.7 | 8.7 |
+| bge-base | 109.09M | 12 / 1024 / 7e-5 / 3e-4 | 2340 | 12 / 1024 / 7e-5 / 3e-5 | 1044 | 24.7 | 11.7 |
+| bge-large | 334.35M | 8 / 256 / 1e-4 / 3e-4 | 6248 | 8 / 256 / 3e-5 / 3e-5 | 1500 of 2808 (crashed) | 65.4 | 16.0 |
+
+- bge-large refinement died at step 1500 (NCCL collective timeout while rank 0 saved the step-1500 checkpoint,
+  rank 1 SIGABRT). No `bge_aligned_cr/final`, so no eval rows for it; its refine numbers below are the in-training
+  val evals (same val set and corpus as the final eval: for small/base the logged val nDCG@10 matches the final
+  table to 4 decimals).
+
+### Retrieval quality (test)
+
+| run | R@10 | R@100 | MRR@10 | nDCG@10 | retention |
+|---|---|---|---|---|---|
+| teacher | 0.9457 | 0.9928 | 0.7639 | 0.8063 | 1.0000 |
+| bge-small aligned | 0.7572 | 0.9266 | 0.5166 | 0.5714 | 0.7087 |
+| bge-small aligned_cr | 0.8171 | 0.9532 | 0.5783 | 0.6327 | 0.7848 |
+| bge-base aligned | 0.8629 | 0.9709 | 0.6389 | 0.6905 | 0.8564 |
+| bge-base aligned_cr | 0.8850 | 0.9760 | 0.6601 | 0.7121 | 0.8832 |
+| bge-large aligned | n/a | n/a | n/a | n/a | n/a |
+| bge-large aligned_cr | n/a | n/a | n/a | n/a | n/a |
+
+<details>
+<summary>Retrieval quality (val)</summary>
+
+| run | R@10 | R@100 | MRR@10 | nDCG@10 | retention |
+|---|---|---|---|---|---|
+| teacher | 0.9405 | 0.9937 | 0.7591 | 0.8015 | 1.0000 |
+| bge-small aligned | 0.7556 | 0.9325 | 0.5184 | 0.5722 | 0.7139 |
+| bge-small aligned_cr | 0.8240 | 0.9541 | 0.5782 | 0.6347 | 0.7919 |
+| bge-base aligned | 0.8510 | 0.9685 | 0.6245 | 0.6766 | 0.8442 |
+| bge-base aligned_cr | 0.8719 | 0.9736 | 0.6442 | 0.6971 | 0.8697 |
+
+</details>
+
+**Observations:**
+
+### Contrastive refinement gain vs student size (val, from training logs)
+
+Val is the only split all three have. `aligned` = last align eval, `cr last` = last refine eval,
+`cr best` = best refine eval (step). Qwen3-0.6B (LoRA, 10.35M trainable) rows from notebook 04 for reference.
+
+| student | trainable | aligned nDCG@10 | cr last nDCG@10 | cr best nDCG@10 (step) | Δ last | Δ best | aligned R@10 | cr last R@10 |
+|---|---|---|---|---|---|---|---|---|
+| bge-small | 33M | 0.5720 | 0.6347 | 0.6347 (700) | +0.0627 | +0.0627 | 0.7556 | 0.8242 |
+| bge-base | 109M | 0.6768 | 0.6971 | 0.7002 (200) | +0.0203 | +0.0234 | 0.8510 | 0.8717 |
+| bge-large | 334M | 0.7467 | 0.7456 (step 1500) | 0.7502 (400) | −0.0011 | +0.0035 | 0.9045 | 0.9097 |
+| qwen3-0.6B LoRA (04) | 10.35M | 0.6926 | 0.7188 | n/a | +0.0262 | n/a | 0.8635 | 0.8820 |
+
+Refine val nDCG@10 at the first eval (step 100): small 0.6245, base 0.6993, large 0.7491.
+
+**Observations:**
+
+### L2 alignment alone (val)
+
+retention = val nDCG@10 / teacher val nDCG@10 (0.8015). cos = mean cos(student q, teacher q) on val.
+
+| student | aligned nDCG@10 | retention | cos after align | cos after refine (last) |
+|---|---|---|---|---|
+| bge-small | 0.5720 | 0.7137 | 0.8127 | 0.7566 |
+| bge-base | 0.6768 | 0.8444 | 0.8609 | 0.7977 |
+| bge-large | 0.7467 | 0.9316 | 0.9129 | 0.8715 |
+| qwen3-0.6B LoRA (04) | 0.6926 | 0.8641 | n/a | n/a |
+
+**Observations:**
+
+### Efficiency (query encoding, fp16, one T4)
+
+| model | params | ms/query bs=1 | bs=32 |
+|---|---|---|---|
+| bge-small aligned | 33M | 8.019 | 0.353 |
+| bge-small aligned_cr | 33M | 8.099 | 0.357 |
+| bge-base aligned | 109M | 8.681 | 0.390 |
+| bge-base aligned_cr | 109M | 8.561 | 0.381 |
+| bge-large | 334M | n/a | n/a |
+
+**Observations:**
 
 ## Conclusions
 
