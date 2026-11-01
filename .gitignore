@@ -12,3 +12,4 @@ cache/
 *.npy
 *.parquet
 kaggle_runs/
+CLAUDE.md
