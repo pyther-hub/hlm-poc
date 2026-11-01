@@ -9,5 +9,4 @@ markdown: GFM
 exclude:
   - CLAUDE.md
   - README.md        # would also claim the index; the repo page still shows it
-  - blog_todo.md
   - tests/
