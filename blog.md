@@ -1,3 +1,8 @@
+---
+title: Progressive Embedding Distillation
+permalink: /
+---
+
 # Progressive Embedding Distillation
 
 ### A Three-Phase Training Recipe for Building Efficient Retrieval Models

@@ -1,11 +1,13 @@
-# GitHub Pages: serves README.md as the index and doc.md as doc.html.
-title: hlm-poc
-description: A small student query encoder (Qwen3-Embedding-0.6B) retrieving against a frozen teacher index (Qwen3-Embedding-4B)
+# GitHub Pages: serves blog.md as the index (permalink: / in its front matter) and doc.md as doc.html.
+title: Progressive Embedding Distillation
+description: A small student query encoder retrieving against a frozen teacher index (Qwen3-Embedding-4B)
 theme: jekyll-theme-cayman
 
-# GitHub's own renderer: kramdown breaks the <details> tables in README.md and most tables in doc.md
+# GitHub's own renderer: kramdown breaks the <details> tables in blog.md and most tables in doc.md
 markdown: GFM
 
 exclude:
   - CLAUDE.md
+  - README.md        # would also claim the index; the repo page still shows it
+  - blog_todo.md
   - tests/
