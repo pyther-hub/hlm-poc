@@ -1,5 +1,6 @@
 """Alignment: the hook adapter, adapter-only checkpoints, and align_main on 2 CPU processes (train, keep_last,
 resume from the latest step checkpoint)."""
+import math
 import os
 import shutil
 
@@ -66,6 +67,12 @@ def run(tmp_path_factory, tiny_model_dir):
                teacher_emb_dir=emb_dir, out_dir=os.path.join(root, "align"))
     launch(align_main, cfg, nprocs=2)
     return data, emb_dir, cfg
+
+
+def test_train_log_has_grad_norm(run):
+    _, _, cfg = run
+    train = [r for r in read_log(cfg["out_dir"]) if "train_loss" in r]
+    assert train and all(math.isfinite(r["grad_norm"]) and r["grad_norm"] > 0 for r in train)
 
 
 def test_align_trains_and_keeps_last_checkpoints(run):

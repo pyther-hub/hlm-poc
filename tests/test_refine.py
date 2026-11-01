@@ -10,42 +10,146 @@ import torch.nn.functional as F
 from align import read_log
 from conftest import build_teacher_index, tiny_rows
 from data import build_data, save_json
-from ddp import launch
+from ddp import cleanup, launch, setup
 from evaluation import evaluate_model, load_index
 from model import ADAPTER_WEIGHTS, attach_adapter, load_encoder, save_adapter
-from refine import contrastive_loss, mine_negatives, refine_main
+from refine import BLOCKS, contrastive_loss, gather_queries, mine_negatives, refine_main
 
 DEVICE = torch.device("cpu")
 DIM = 32
 TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
 
+def _batch(G=4, K=2, d=8, seed=0):
+    """A global batch: all_q [G, d], pos_docs [G, d], neg_docs [G, K, d] (unit norm), no known positives."""
+    g = torch.Generator().manual_seed(seed)
+    unit = lambda *shape: F.normalize(torch.randn(*shape, generator=g), dim=-1)  # noqa: E731
+    return unit(G, d), unit(G, d), unit(G, K, d), torch.zeros(G, G, dtype=torch.bool), torch.zeros(G, K, dtype=torch.bool)
+
+
+def _eq1(all_q, rows, pos_docs, neg_docs, known_pos, known_neg, tau, margin):
+    """Qwen3 Eq. 1 written out term by term, as python loops. Returns (loss, per-query {block: [unmasked scores]},
+    per-query positive score)."""
+    loss, kept, s_pos = 0.0, [], []
+    for b, i in enumerate(rows.tolist()):
+        q, pos = all_q[i], (all_q[i] @ pos_docs[i]).item()
+        limit, blocks = pos + margin, {k: [] for k in BLOCKS}
+        for j in range(len(all_q)):
+            if j == i or known_pos[b, j]:
+                continue
+            for k, s in (("qd", q @ pos_docs[j]), ("qq", q @ all_q[j]), ("dd", pos_docs[i] @ pos_docs[j])):
+                if s.item() <= limit:
+                    blocks[k].append(s.item())
+        for k in range(neg_docs.shape[1]):
+            s = (q @ neg_docs[b, k]).item()
+            if not known_neg[b, k] and s <= limit:
+                blocks["neg"].append(s)
+        negs = sum(blocks.values(), [])
+        loss -= pos / tau - math.log(sum(math.exp(s / tau) for s in [pos] + negs))
+        kept.append(blocks)
+        s_pos.append(pos)
+    return loss / len(rows), kept, s_pos
+
+
 def test_contrastive_loss_by_hand():
-    torch.manual_seed(0)
-    q, docs = F.normalize(torch.randn(2, 8), dim=-1), F.normalize(torch.randn(4, 8), dim=-1)
-    pos_col, tau = torch.tensor([0, 1]), 0.1
-    known_pos = torch.zeros(2, 4, dtype=torch.bool)
-    known_pos[0, 3] = True  # doc 3 is another labelled positive of query 0
-    loss, masked = contrastive_loss(q, docs, pos_col, known_pos, tau, margin=10.0)  # margin too big to mask
-    want = 0.0
-    for i in range(2):
-        negs = [(q[i] @ docs[j]).item() for j in range(4) if j != pos_col[i] and not known_pos[i, j]]
-        negs.append((q[i] @ q[1 - i]).item())
-        pos = (q[i] @ docs[pos_col[i]]).item()
-        want -= pos / tau - math.log(sum(math.exp(s / tau) for s in [pos] + negs))
-    assert loss.item() == pytest.approx(want / 2, abs=1e-5)
-    assert masked.item() == pytest.approx(1 / 8)  # 1 of 2 * (3 docs + 1 query) negatives
+    all_q, pos_docs, neg_docs, known_pos, known_neg = _batch()
+    rows, tau = torch.tensor([2, 3]), 0.1  # this rank's queries, as rank 1 of 2 with B = 2
+    known_pos[2, 0] = True  # query 0's positive is also a labelled positive of query 2
+    known_neg[3, 1] = True  # a negative of query 3 is one of its labelled positives
+    args = (all_q, rows, pos_docs, neg_docs[rows], known_pos[rows], known_neg[rows], tau)
+    loss, stats = contrastive_loss(*args, margin=10.0)  # margin too big to mask
+    want, kept, s_pos = _eq1(*args, margin=10.0)
+    assert loss.item() == pytest.approx(want, abs=1e-5)
+    assert [len(kept[0][k]) for k in BLOCKS] == [2, 2, 2, 2] and [len(kept[1][k]) for k in BLOCKS] == [3, 1, 3, 3]
+    assert stats["s_pos"].item() == pytest.approx(sum(s_pos) / 2, abs=1e-6)
+    hardest = [max(sum(blocks.values(), [])) for blocks in kept]
+    assert stats["acc"].item() == sum(p > h for p, h in zip(s_pos, hardest)) / 2
+    assert stats["gap"].item() == pytest.approx(sum(p - h for p, h in zip(s_pos, hardest)) / 2, abs=1e-5)
+    # per block: masked / negatives over both queries (q-d, q-q, d-d: 3 per query, own negatives: 2)
+    assert [stats[f"m_{k}"].item() for k in BLOCKS] == pytest.approx([1 / 6, 1 / 4, 1 / 6, 1 / 6])
+    for k in BLOCKS:
+        share = [sum(math.exp(s / tau) for s in blocks[k]) / sum(math.exp(s / tau) for s in sum(blocks.values(), []))
+                 for blocks in kept]
+        assert stats[f"z_{k}"].item() == pytest.approx(sum(share) / 2, abs=1e-5)
+    assert sum(stats[f"z_{k}"].item() for k in BLOCKS) == pytest.approx(1.0, abs=1e-5)
 
 
-def test_contrastive_loss_masks_negatives_above_margin():
-    torch.manual_seed(0)
-    q, docs = F.normalize(torch.randn(1, 8), dim=-1), F.normalize(torch.randn(2, 8), dim=-1)
-    pos_col = torch.tensor([0])
-    near_dup = torch.cat([docs, q])  # extra doc identical to the query: scores 1 > s(q, d+) + 0.1
-    assert (q @ docs[0]).item() + 0.1 < 1
-    loss, masked = contrastive_loss(q, near_dup, pos_col, torch.zeros(1, 3, dtype=torch.bool), 0.05, margin=0.1)
-    without, _ = contrastive_loss(q, docs, pos_col, torch.zeros(1, 2, dtype=torch.bool), 0.05, margin=0.1)
-    assert loss.item() == pytest.approx(without.item(), abs=1e-6) and masked.item() == pytest.approx(1 / 2)
+def test_contrastive_loss_masks():
+    all_q, pos_docs, neg_docs, known_pos, known_neg = _batch(G=3)
+    rows = torch.tensor([0])
+    q = all_q[0]
+    all_q[2], pos_docs[1], neg_docs[0, 1] = q, q, q  # a near-duplicate of query 0 in q-q, q-d and its negatives
+    assert (q @ pos_docs[0]).item() + 0.1 < 1  # each scores 1 > s(q, d+) + margin
+    args = (all_q, rows, pos_docs, neg_docs[rows], known_pos[rows], known_neg[rows], 0.05)
+    loss, stats = contrastive_loss(*args, margin=0.1)
+    assert loss.item() == pytest.approx(_eq1(*args, margin=0.1)[0], abs=1e-5)
+    assert stats["m_qd"].item() >= 0.5 and stats["m_qq"].item() >= 0.5 and stats["m_neg"].item() >= 0.5
+    without, _ = contrastive_loss(all_q, rows, pos_docs, neg_docs[rows][:, :1], known_pos[rows],
+                                  known_neg[rows][:, :1], 0.05, margin=0.1)
+    assert loss.item() == pytest.approx(without.item(), abs=1e-6)  # a masked negative = an absent one
+
+    # queries 0 and 1 share a positive: each masks the other's q-d, q-q and d-d entries
+    all_q, pos_docs, neg_docs, known_pos, known_neg = _batch(G=2)
+    pos_docs[1] = pos_docs[0]
+    known_pos[:] = True  # caller: isin(positives of the batch, labelled positives of the query)
+    _, stats = contrastive_loss(all_q, torch.tensor([0, 1]), pos_docs, neg_docs, known_pos, known_neg, 0.05, 10.0)
+    assert [stats[f"m_{k}"].item() for k in ("qd", "qq", "dd")] == [1.0, 1.0, 1.0] and stats["m_neg"].item() == 0.0
+
+
+def test_contrastive_loss_gradients():
+    all_q, pos_docs, neg_docs, known_pos, known_neg = _batch()
+    all_q.requires_grad_(True)
+    rows = torch.tensor([2, 3])
+    loss, stats = contrastive_loss(all_q, rows, pos_docs, neg_docs[rows], known_pos[rows], known_neg[rows], 0.05, 0.1)
+    loss.backward()
+    assert (all_q.grad.norm(dim=-1) > 0).all()  # rows 0, 1 belong to another rank: their gradient comes from q-q
+    assert not pos_docs.requires_grad and not neg_docs.requires_grad  # teacher docs: plain tensors, frozen
+    assert not any(v.requires_grad for v in stats.values())
+
+
+def test_contrastive_loss_stable():
+    v = F.normalize(torch.randn(8), dim=-1)
+    G, K = 4, 2
+    all_q, pos_docs, neg_docs = v.repeat(G, 1), v.repeat(G, 1), v.repeat(G, K, 1)
+    known_pos, known_neg = torch.zeros(G, G, dtype=torch.bool), torch.zeros(G, K, dtype=torch.bool)
+    rows = torch.arange(G)
+    loss, _ = contrastive_loss(all_q, rows, pos_docs, neg_docs, known_pos, known_neg, 0.01, 0.1)  # all ties at 1/tau
+    assert loss.item() == pytest.approx(math.log(1 + 3 * (G - 1) + K), abs=1e-4)
+    loss, stats = contrastive_loss(all_q, rows, pos_docs, neg_docs, known_pos, known_neg, 0.01, -1.0)  # mask all
+    assert loss.item() == pytest.approx(0.0, abs=1e-6) and stats["acc"].item() == 1.0
+    assert all(math.isfinite(v.item()) for v in stats.values())
+    assert [stats[f"m_{k}"].item() for k in BLOCKS] == [1.0] * 4
+
+
+def _gather_worker(rank, world_size, cfg):
+    """One rank of test_gather_matches_one_process: loss + query gradients of this rank's slice of _batch."""
+    setup(rank, world_size)
+    all_q, pos_docs, neg_docs, known_pos, known_neg = _batch(G=cfg["G"])
+    all_q[4] = all_q[1]  # a duplicate query on the other rank: masked in q-q across ranks
+    known_pos[0, 1] = True
+    B = cfg["G"] // world_size
+    rows = torch.arange(rank * B, (rank + 1) * B)
+    q = all_q[rows].clone().requires_grad_(True)
+    loss, _ = contrastive_loss(gather_queries(q), rows, pos_docs, neg_docs[rows], known_pos[rows], known_neg[rows],
+                               0.05, 0.1)
+    loss.backward()
+    torch.save(dict(loss=loss.detach(), grad=q.grad), os.path.join(cfg["out"], f"rank{rank}.pt"))
+    cleanup()
+
+
+def test_gather_matches_one_process(tmp_path):
+    G = 6
+    launch(_gather_worker, dict(G=G, out=str(tmp_path)), nprocs=2)
+    ranks = [torch.load(os.path.join(tmp_path, f"rank{r}.pt")) for r in range(2)]
+    all_q, pos_docs, neg_docs, known_pos, known_neg = _batch(G=G)
+    all_q[4] = all_q[1]
+    known_pos[0, 1] = True
+    all_q.requires_grad_(True)
+    loss, _ = contrastive_loss(all_q, torch.arange(G), pos_docs, neg_docs, known_pos, known_neg, 0.05, 0.1)
+    loss.backward()
+    assert torch.stack([r["loss"] for r in ranks]).mean().item() == pytest.approx(loss.item(), abs=1e-6)
+    # DDP averages parameter gradients over ranks: per-rank query gradients / world_size = the global mean's gradient
+    assert torch.allclose(torch.cat([r["grad"] for r in ranks]) / 2, all_q.grad, atol=1e-6)
 
 
 def test_mine_negatives():
@@ -72,8 +176,10 @@ def run(tmp_path_factory, tiny_model_dir):
     save_adapter(model, init, dict(base=tiny_model_dir, rank=4, alpha=8, dropout=0.0, targets=list(TARGETS),
                                    out_dim=DIM))
     init_mtime = os.path.getmtime(os.path.join(init, ADAPTER_WEIGHTS))
-    cfg = dict(init_adapter=init, dim=DIM, lr=1e-2, head_lr=1e-2, warmup_ratio=0.0, epochs=4, batch_size=4,
-               log_every=3, eval_every=6, save_every=100, data_path=os.path.join(root, "data.json"),
+    # margin 10: no margin masks, so cr compares over the same negatives at every step. With the default 0.1 the tiny
+    # random model starts with every q-q / d-d pair masked as a near-duplicate and cr rises as they unmask.
+    cfg = dict(init_adapter=init, dim=DIM, margin=10.0, lr=1e-2, head_lr=1e-2, warmup_ratio=0.0, epochs=4,
+               batch_size=4, log_every=3, eval_every=6, save_every=100, data_path=os.path.join(root, "data.json"),
                teacher_emb_dir=emb_dir, out_dir=os.path.join(root, "refine"))
     launch(refine_main, cfg, nprocs=2)
     return data, emb_dir, cfg, init_mtime
@@ -83,7 +189,8 @@ def test_refine_trains_from_adapter(run):
     data, emb_dir, cfg, init_mtime = run
     log = read_log(cfg["out_dir"])
     train = [r for r in log if "train_loss" in r]
-    assert len(train) == 4 and all({"cr", "l2", "masked"} <= set(r) for r in train)  # 28 train queries / 8 = 3 x 4
+    stat_keys = {"cr", "l2", "acc", "s_pos", "gap", "grad_norm"} | {f"{p}_{k}" for p in "mz" for k in BLOCKS}
+    assert len(train) == 4 and all(stat_keys <= set(r) for r in train)  # 28 train queries / 8 = 3 x 4
     assert train[-1]["cr"] < train[0]["cr"]
     assert [r["step"] for r in log if "val_loss" in r] == [6, 12]
     assert os.path.getmtime(os.path.join(cfg["init_adapter"], ADAPTER_WEIGHTS)) == init_mtime  # init untouched

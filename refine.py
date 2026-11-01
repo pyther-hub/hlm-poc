@@ -1,11 +1,13 @@
-"""Contrastive refinement: continue training the phase-2 adapter (LoRA + head; base frozen) with
-L_CR = -1/B sum_i log exp(s(q_i, d_i+)/tau) / (exp(s(q_i, d_i+)/tau) + sum_{u in N_i} exp(s_u/tau)),
-s(q, d) = <student(q), teacher(d)>, documents = the frozen teacher corpus vectors (corpus.npy, never re-encoded),
-plus l2_weight * L2(student q, teacher q) to stay near the teacher query space.
-N_i = every doc of the global batch other than d_i+ (each query's positive + its n_neg negatives: the stored
-negative[0] plus n_neg - 1 mined by teacher score, see mine_negatives; the global batch
-is the same on every rank, so these are free) + the other student queries on this rank (same tower), minus false
-negatives: q_i's other labelled positives and anything scoring above s(q_i, d_i+) + margin.
+"""Contrastive refinement: continue training the phase-2 adapter (LoRA + head; base frozen) with the Qwen3-Embedding
+loss (arXiv 2506.05176, Eq. 1) over the global batch of G queries,
+L_CR = -1/B sum_i log exp(s(q_i, d_i+)/tau) / Z_i,
+Z_i = exp(s(q_i, d_i+)/tau) + sum_k m exp(s(q_i, d_ik-)/tau) + sum_{j!=i} m exp(s(q_i, q_j)/tau)
+      + sum_{j!=i} m exp(s(d_i+, d_j+)/tau) + sum_{j!=i} m exp(s(q_i, d_j+)/tau),
+s = dot of unit vectors, q = student queries (all-gathered with grad, see gather_queries), d = the frozen teacher
+corpus vectors (corpus.npy, never re-encoded), plus l2_weight * L2(student q, teacher q). d_ik- = q_i's own n_neg
+negatives: the stored negative[0] plus n_neg - 1 mined by teacher score (mine_negatives). m = 0 (false negative) for
+q_i's labelled positives (so also a d_j+ equal to d_i+), q_i itself, and anything scoring above s(q_i, d_i+) + margin.
+s(d_i+, d_j+) is teacher-teacher: no gradient, a per-query constant in Z_i.
 Same loop, checkpoints and resume as align.py (align.run)."""
 import functools
 import os
@@ -13,11 +15,12 @@ import traceback
 
 import numpy as np
 import torch
+import torch.distributed.nn.functional as dist_nn
 import torch.nn.functional as F
 
 from align import final_exists, l2_loss, load_rank0_first, run
 from data import load_emb, load_json, resolve_cfg
-from ddp import cleanup, setup
+from ddp import cleanup, is_dist, setup
 from model import ADAPTER_CONFIG, adapter_params, embed, gpu_mem, tokenize
 
 REFINE_DEFAULTS = dict(
@@ -28,7 +31,7 @@ REFINE_DEFAULTS = dict(
     tau=0.05,                           # temperature
     margin=0.1,                         # negative with s > s(q, d+) + margin is masked as a false negative
     n_neg=1,                            # negatives per query: 1 = the stored one, k > 1 adds k-1 teacher-mined ones
-    l2_weight=0.1,                      # weight of L2(student q, teacher q); 0 = pure L_CR
+    l2_weight=0.0,                      # weight of L2(student q, teacher q); 0 = pure L_CR (L2 is still logged)
     lr=5e-5,                            # LoRA params
     head_lr=1e-4,                       # head params
     weight_decay=0.0,
@@ -51,22 +54,61 @@ REFINE_DEFAULTS = dict(
 )
 
 
-def contrastive_loss(q, docs, pos_col, known_pos, tau, margin):
-    """L_CR for B student queries q [B, d] against M teacher docs [M, d] (both unit norm).
-    pos_col [B]: column of each query's positive. known_pos [B, M] bool: other columns that are labelled positives of
-    that query. Negatives = every other doc column + the other queries in q. Masked (false negatives): known_pos,
-    and any negative scoring above s(q_i, d_i+) + margin. Returns (loss, fraction of negatives masked)."""
-    rows = torch.arange(len(q), device=q.device)
-    s_qd, s_qq = q @ docs.T, q @ q.T
-    s_pos = s_qd[rows, pos_col][:, None]
-    limit = s_pos.detach() + margin
-    mask_qd = known_pos | (s_qd.detach() > limit)
-    mask_qd[rows, pos_col] = False
-    mask_qq = torch.eye(len(q), dtype=torch.bool, device=q.device) | (s_qq.detach() > limit)
-    logits = torch.cat([s_qd.masked_fill(mask_qd, float("-inf")), s_qq.masked_fill(mask_qq, float("-inf"))], 1)
-    n_neg = s_qd.numel() + s_qq.numel() - 2 * len(q)  # minus the positives and the diagonal
-    masked = (mask_qd.sum() + mask_qq.sum() - len(q)).float() / n_neg
-    return F.cross_entropy(logits / tau, pos_col), masked
+BLOCKS = ("qd", "neg", "qq", "dd")  # column blocks of the logits, in order
+
+
+def contrastive_loss(all_q, rows, pos_docs, neg_docs, known_pos, known_neg, tau, margin):
+    """L_CR (Qwen3 Eq. 1) for this rank's B queries all_q[rows] of a global batch of G (all unit norm).
+    all_q [G, d] student queries (grad), rows [B] global index of this rank's queries, pos_docs [G, d] the teacher
+    positive of each query, neg_docs [B, K, d] each local query's own negatives. known_pos [B, G] / known_neg [B, K]
+    bool: that doc is a labelled positive of the query (covers duplicate positives). Logit blocks per query: q-d
+    (its positive at column rows[i], the other queries' positives), own negatives, q-q, d-d (teacher-teacher, no grad).
+    Masked: known positives, the query itself, and anything scoring above s(q_i, d_i+) + margin (detached).
+    Returns (loss, stats): detached diagnostics, see contrastive_stats."""
+    q = all_q[rows]
+    s = dict(qd=q @ pos_docs.T, neg=torch.einsum("bd,bkd->bk", q, neg_docs), qq=q @ all_q.T,
+             dd=pos_docs[rows] @ pos_docs.T)
+    s_pos = s["qd"][torch.arange(len(q), device=q.device), rows]
+    limit = s_pos.detach()[:, None] + margin
+    self_ = F.one_hot(rows, len(all_q)).bool()
+    mask = {k: v.detach() > limit for k, v in s.items()}
+    mask["qd"] = (mask["qd"] | known_pos) & ~self_
+    mask["neg"] = mask["neg"] | known_neg
+    mask["qq"] = mask["qq"] | known_pos | self_
+    mask["dd"] = mask["dd"] | known_pos | self_
+    logits = torch.cat([s[k].masked_fill(mask[k], float("-inf")) for k in BLOCKS], 1)
+    loss = F.cross_entropy(logits / tau, rows)
+    return loss, contrastive_stats(s, mask, s_pos, self_, logits, rows, tau)
+
+
+@torch.no_grad()
+def contrastive_stats(s, mask, s_pos, self_, logits, rows, tau):
+    """acc: share of queries whose positive is the top logit. s_pos: mean s(q_i, d_i+). gap: mean s_pos - hardest
+    unmasked negative (rows with every negative masked skipped). m_<block>: masked share of that block's negatives
+    (self not counted). z_<block>: that block's share of the negative mass of Z_i, mean over queries (sum to 1)."""
+    stats = dict(acc=(logits.argmax(1) == rows).float().mean(), s_pos=s_pos.float().mean())
+    neg_mask = {**mask, "qd": mask["qd"] | self_}  # the positive is not a negative
+    neg = torch.cat([s[k].float().masked_fill(neg_mask[k], float("-inf")) for k in BLOCKS], 1)
+    gap = s_pos.float() - neg.max(1).values
+    finite = torch.isfinite(gap)  # +inf: every negative of that query masked
+    stats["gap"] = torch.where(finite, gap, 0.0).sum() / finite.sum().clamp(min=1)
+    for k in BLOCKS:
+        n_self = 0 if k == "neg" else len(rows)  # q-d: the positive (never masked), q-q / d-d: the query (always)
+        masked = mask[k].sum() - (0 if k in ("neg", "qd") else n_self)
+        stats[f"m_{k}"] = masked.float() / max(mask[k].numel() - n_self, 1)
+    p = torch.softmax(neg / tau, 1).nan_to_num(0.0)  # a row with every negative masked: all zero
+    start = 0
+    for k in BLOCKS:
+        width = s[k].shape[1]
+        stats[f"z_{k}"] = p[:, start:start + width].sum(1).mean()
+        start += width
+    return stats
+
+
+def gather_queries(q):
+    """[B, d] per rank -> [world_size * B, d] in rank order, differentiable: backward sums each rank's gradient back
+    to the query's own rank. DDP's mean over ranks then gives the gradient of the global mean loss."""
+    return torch.cat(dist_nn.all_gather(q)) if is_dist() else q
 
 
 def mine_negatives(teacher_q, docs, pos, neg, n_neg, chunk=256):
@@ -131,17 +173,18 @@ def train(rank, world_size, cfg, device):
 
 
 def _refine_batch_loss(model, global_idx, local, epoch, tokenizer, queries, neg, docs, teacher_q, cfg, device):
-    # docs of the whole global batch: positives (one per query, rotating over its positives by epoch), then negatives
-    pos = [queries["pos"][i][epoch % len(queries["pos"][i])] for i in global_idx]
-    cols = np.concatenate([pos, neg[global_idx].ravel()])
+    # one positive per query of the whole global batch (rotating over its positives by epoch), indexed locally: every
+    # rank holds the corpus and the same global_idx, so this equals an all_gather of the positives
+    pos = np.array([queries["pos"][i][epoch % len(queries["pos"][i])] for i in global_idx])
     idx = global_idx[local]
-    known_pos = torch.from_numpy(np.stack([np.isin(cols, queries["pos"][i]) for i in idx])).to(device)
-    pos_col = torch.arange(len(global_idx), device=device)[local]
-    known_pos[torch.arange(len(idx), device=device), pos_col] = False
+    rows = torch.arange(len(global_idx), device=device)[local]
+    known_pos = torch.from_numpy(np.stack([np.isin(pos, queries["pos"][i]) for i in idx])).to(device)
+    known_neg = torch.from_numpy(np.stack([np.isin(neg[i], queries["pos"][i]) for i in idx])).to(device)
 
     enc = tokenize(tokenizer, [queries["texts"][i] for i in idx], cfg["max_query_len"], cfg["query_prefix"])
     q = embed(model, enc["input_ids"].to(device), enc["attention_mask"].to(device), cfg["dim"]).float()
-    cr, masked = contrastive_loss(q, docs[torch.from_numpy(cols).to(device)].float(), pos_col, known_pos,
-                                  cfg["tau"], cfg["margin"])
+    cr, stats = contrastive_loss(gather_queries(q), rows, docs[torch.from_numpy(pos).to(device)].float(),
+                                 docs[torch.from_numpy(neg[idx]).to(device)].float(), known_pos, known_neg,
+                                 cfg["tau"], cfg["margin"])
     l2 = l2_loss(q, teacher_q[idx].to(device))
-    return {"loss": cr + cfg["l2_weight"] * l2, "cr": cr, "l2": l2, "masked": masked}
+    return {"loss": cr + cfg["l2_weight"] * l2, "cr": cr, "l2": l2, **stats}

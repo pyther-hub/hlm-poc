@@ -56,7 +56,7 @@ align_main (2 GPUs, DDP): student(align query) ≈ teacher align.npy, adapter on
 prune_main (2 GPUs, DDP): aligned → prog_l14 → prog_l7, cut layers, full fine-tune, same L2
    ─▶ runs/<mode>/prog_l<n>/{step_<n>, final}/ (whole state dict, full: true)
    ▼
-refine_main (2 GPUs, DDP): from each of the above; L_CR over train queries vs teacher corpus.npy + λ·L2 to teacher q
+refine_main (2 GPUs, DDP): from each of the above; Qwen3 L_CR over train queries vs teacher corpus.npy (+ optional λ·L2)
    ─▶ runs/<mode>/<student>_cr/{step_<n>, final}/, log.jsonl
 ```
 
@@ -126,13 +126,42 @@ Off Kaggle every `IN_*` is the repo dir.
 Sessions are capped at 9 h. Every training / embedding step is resumable (`step_<n>/` checkpoints, existing shards
 skipped) and a finished stage (`final/` exists) is skipped.
 
-Phase-3 loss, per GPU (B queries) with the global batch's docs (positive + `n_neg` negatives of every query in
-it, all ranks; the docs are frozen teacher vectors, so no gather is needed):
+Phase-3 loss: the Qwen3-Embedding objective (arXiv 2506.05176, Eq. 1), per GPU (B queries) over the global batch of
+G = B·world queries. Student queries are all-gathered with grad (`gather_queries`); the positives d_j+ are frozen
+teacher vectors that every rank indexes locally (same corpus, same global batch, so no gather is needed):
 ```
-logits_i = [ s(q_i, d_j) for all (1+n_neg)·B·world docs ] ++ [ s(q_i, q_j) for the B queries on this GPU ]   / tau
-masked   = q_i's other labelled positives, q_i itself, and any negative with s > s(q_i, d_i+) + margin
-L        = CE(logits, own positive) + l2_weight · ||q_i − teacher(q_i)||²
+logits_i = [ s(q_i, d_j+) for the G positives ]  ++ [ s(q_i, d_ik-) for q_i's own n_neg negatives ]
+        ++ [ s(q_i, q_j)  for the G queries    ]  ++ [ s(d_i+, d_j+) for the G positives ]            / tau
+masked   = q_i's labelled positives (so a d_j+ equal to d_i+, in every block), q_i itself (q-q, d-d),
+           and any negative with s > s(q_i, d_i+) + margin
+L        = CE(logits, own positive) + l2_weight · ||q_i − teacher(q_i)||²       (l2_weight 0 by default)
 ```
+Deviations from Eq. 1:
+- The doc side is frozen, so the d-d term s(d_i+, d_j+) has no gradient: it is a per-query constant in Z_i
+  (large only when a near-duplicate of d_i+ is in the batch).
+- The paper leaves the hard-negative mask m_ik undefined and defines s_ij only for q-d / q-q. Here the same margin rule
+  applies to every block.
+- Masking covers every labelled positive of q_i, not only d_j = d_i+.
+- The L2 term is not in the paper.
+- The global batch is one micro-batch (`grad_accum` does not add negatives).
+- tau is a knob (the paper gives no value).
+
+Gradient scale: each rank averages over its B queries, the gather's backward sums each query's gradient back to its
+rank, and DDP averages over ranks. Together that is exactly the gradient of the mean over all G queries (tested 2 vs
+1 process).
+
+CR diagnostics, logged with every train row (that step's values, mean over micro-batches and ranks):
+| Key | What | Reads as |
+|---|---|---|
+| `acc` | share of queries whose positive is the top logit | → 1: the in-batch task is solved, little signal |
+| `s_pos` | mean s(q_i, d_i+) | is the student pulled toward its positive |
+| `gap` | mean s_pos − hardest unmasked negative (queries with every negative masked skipped) | large: negatives too easy; < 0: a negative outranks d+ |
+| `m_qd`, `m_neg`, `m_qq`, `m_dd` | masked share of each block's negatives (q_i itself not counted) | high: the margin / false negatives remove most negatives |
+| `z_qd`, `z_neg`, `z_qq`, `z_dd` | each block's share of the negative mass of Z_i, mean over queries (sum to 1) | which term drives the gradient, e.g. q-q (pushes queries apart) or the constant d-d |
+| `grad_norm` | total grad norm before clipping (every phase logs it) | ≫ `grad_clip`: every step is clipped; → 0: the signal collapsed |
+
+Masks change as the student moves, so `cr` values from different steps are over different negative sets.
+Read `cr` together with `m_*`.
 
 **Loss functions** live in `align.LOSSES` (name → `fn(student, teacher, **loss_kwargs)`, both `[B, dim]` unit
 vectors) and are picked in the control panel with `loss` / `loss_kwargs`. They can't be defined in a notebook cell:
@@ -252,7 +281,8 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `exp_latency(models, data, index, exp_dir, device, dim, n_queries, batch_sizes)` | `measure_latency` per model (first = reference) → `latency.json`, speedups; mean cos(q, d+) on val; plot. |
 | `train_once`, `evaluate_runs`, `cos_to_positive`, `plot_curves`, `plot_bars`, `print_rows`, `save_fig` | Skip finished arms / rows (+ the teacher row); helpers. |
 | `mine_negatives(teacher_q, docs, pos, neg, n_neg, chunk=256)` | `[N, n_neg]` negative corpus rows per query: stored negative first, then the top teacher-scored docs excluding positives and the stored one. `n_neg=1` skips scoring. |
-| `contrastive_loss(q, docs, pos_col, known_pos, tau, margin)` | L_CR with doc + same-tower query negatives and false-negative masking; returns `(loss, masked fraction)`. |
+| `contrastive_loss(all_q, rows, pos_docs, neg_docs, known_pos, known_neg, tau, margin)` | Qwen3 Eq. 1 L_CR for this rank's queries `all_q[rows]`: q-d, own negatives, q-q, d-d blocks with false-negative masking; returns `(loss, stats)` (the CR diagnostics, detached). |
+| `gather_queries(q)` | `[B, d]` per rank → `[world·B, d]` in rank order, differentiable (`torch.distributed.nn.functional.all_gather`); identity without a process group. |
 
 ### `ddp.py`
 `launch(fn, *args, nprocs)`, `setup`, `cleanup`, `barrier`, `is_main`, `get_rank`, `get_world_size`,
@@ -306,10 +336,10 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 |---|---|---|
 | `init_adapter` | `"runs/align/final"` | Phase-2 adapter dir; read only. LoRA shape and dropout come from its config. |
 | `dim`, `query_prefix`, `max_query_len` | `256`, `""`, `32` | Must match phase 2 / the teacher index. |
-| `tau`, `margin`, `l2_weight` | `0.05`, `0.1`, `0.1` | Temperature; false-negative margin; λ of the L2 term (0 = pure L_CR). |
-| `n_neg` | `1` | Negatives per query. `1` = the stored `negative[0]` only (no mining); `k > 1` adds the `k-1` corpus docs the teacher scores highest for the query (never a labelled positive), mined once at start. |
+| `tau`, `margin`, `l2_weight` | `0.05`, `0.1`, `0.0` | Temperature; false-negative margin (Qwen3: 0.1); λ of the L2 term (0 = pure L_CR; L2 is logged either way). |
+| `n_neg` | `1` | Each query's own hard negatives (only that query sees them). `1` = the stored `negative[0]` only (no mining); `k > 1` adds the `k-1` corpus docs the teacher scores highest for the query (never a labelled positive), mined once at start. |
 | `lr`, `head_lr`, `weight_decay`, `warmup_ratio` | `5e-5`, `1e-4`, `0.0`, `0.05` | AdamW; warmup then cosine to 0. |
-| `epochs`, `batch_size`, `grad_clip`, `amp`, `seed` | `1`, `64`, `1.0`, `True`, `0` | `batch_size` = queries per GPU (docs per step = (1 + n_neg) · batch_size · world_size). |
+| `epochs`, `batch_size`, `grad_clip`, `amp`, `seed` | `1`, `64`, `1.0`, `True`, `0` | `batch_size` = queries per GPU; per query 3·(G−1) + n_neg negatives, G = batch_size · world_size. |
 | `grad_accum`, `patience` | `1`, `0` | As in ALIGN; in-batch negatives stay per micro-batch. |
 | `stop_on` | `"val_ndcg@10"` | As in ALIGN. Not `val_loss`: that is L2, which rises while CR improves nDCG. |
 | `log_every`, `eval_every`, `save_every`, `keep_last` | `20`, `200`, `500`, `2` | Steps; `eval_every=0` = only at the end, `save_every=0` = no step checkpoints. Debug: `5 / 20 / 20`. |
@@ -350,9 +380,12 @@ Docs and notebooks always use `from model import ...` (never `import model`; the
 | `test_full_align_with_frozen_embeddings` | `full=True, freeze_embeddings=True` not freezing the embeddings or not training the rest. |
 | `test_freeze_embeddings_keeps_them_and_trains_the_rest` | `freeze_embeddings` not freezing them, or freezing more than them. |
 | `test_grad_accum_matches_bigger_batch`, `test_early_stop_keeps_best` | `grad_accum=2` at half the batch drifting from one big batch; early stop not stopping, leaving `best/` or step dirs, or `final/` not being the lowest-val_loss weights. |
-| `test_contrastive_loss_by_hand`, `test_contrastive_loss_masks_negatives_above_margin` | L_CR formula, known-positive masking, margin masking (a masked doc = an absent doc). |
+| `test_contrastive_loss_by_hand`, `test_contrastive_loss_masks` | Eq. 1 against python loops (global rows of a 2-rank batch), every diagnostic by hand; known-positive, duplicate-positive and margin masking in each block (a masked negative = an absent one). |
+| `test_contrastive_loss_gradients`, `test_contrastive_loss_stable` | Every gathered query (other ranks' too) gets a gradient, teacher docs none; ties at tau 0.01 and an all-masked batch stay finite. |
+| `test_gather_matches_one_process` | 2-process `gather_queries` + loss: mean loss and query gradients / world_size equal one process over the whole batch (indexing, cross-rank q-q, DDP scale). |
+| `test_train_log_has_grad_norm` | Train rows without a finite `grad_norm`. |
 | `test_mine_negatives`, `test_refine_with_mined_negatives` | Mined negatives skip positives and the stored negative (`n_neg=1` = stored only); a 2-process run with `n_neg=3` trains and saves. |
-| `test_refine_trains_from_adapter` | 2-process refinement from a saved adapter: contrastive loss goes down, val rows logged, the init adapter untouched, final adapter evaluates. |
+| `test_refine_trains_from_adapter` | 2-process refinement from a saved adapter (margin 10: same negatives every step): contrastive loss goes down, diagnostics + val rows logged, the init adapter untouched, final adapter evaluates. |
 | `test_select_layers`, `test_prune_keep_all_is_identity`, `test_ffn_pruning_drops_dead_neurons` | Layer choice; surgery that changes outputs when it shouldn't; neuron scores / slicing. |
 | `test_merge_lora_matches_hooks`, `test_pruned_checkpoint_roundtrip_and_chain`, `test_full_model_trains_every_weight` | Merged LoRA ≠ hooked LoRA; full checkpoints not reloading; progressive indices not relative to the base; frozen weights in a full fine-tune. |
 | `test_prune_main_trains_pruned_student`, `test_refine_trains_pruned_student` | 2-process pruning trains and saves a 1-layer full checkpoint; CR on it trains. |

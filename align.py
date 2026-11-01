@@ -223,7 +223,7 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
             for name, v in out.items():
                 parts[name] = parts.get(name, 0) + v.detach() / accum
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(params, cfg["grad_clip"])
+        grad_norm = torch.nn.utils.clip_grad_norm_(params, cfg["grad_clip"])  # before clipping; same on every rank
         scaler.step(opt)
         scaler.update()
         sched.step()
@@ -232,8 +232,8 @@ def run(model, tokenizer, adapter_cfg, cfg, rank, world_size, device, n_items, b
         if step % cfg["log_every"] == 0 or step == total:
             means = {("train_loss" if k == "loss" else k): reduce_mean(float(v), device) for k, v in parts.items()}
             if is_main():
-                log_row(cfg, tag, dict(step=step, epoch=epoch, **means, lr=sched.get_last_lr()[0],
-                                       min=(time.perf_counter() - t0) / 60))
+                log_row(cfg, tag, dict(step=step, epoch=epoch, **means, grad_norm=float(grad_norm),
+                                       lr=sched.get_last_lr()[0], min=(time.perf_counter() - t0) / 60))
         if (cfg["eval_every"] and step % cfg["eval_every"] == 0) or step == total:
             stop = 0.0
             if is_main():
