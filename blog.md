@@ -7,6 +7,32 @@ permalink: /
 
 ### A Three-Phase Training Recipe for Building Efficient Retrieval Models
 
+## Contents
+
+- [1. Problem Statement](#s1)
+- [2. Teacher Embedding Generation](#s2)
+- [3. Dataset and Experimental Setup](#s3)
+  - [Computational Setup](#s3-compute)
+- [4. Teacher Baseline](#s4)
+- [5. Three-Phase Training Recipe](#s5)
+  - [Phase 1: L2 Alignment](#phase-1)
+  - [Phase 2: Structured Pruning and Recovery](#phase-2)
+  - [Phase 3: Contrastive Refinement](#phase-3)
+- [6. Experiments](#s6)
+  - [6.1 LoRA alignment and progressive pruning](#s6-1)
+  - [6.2 Contrastive refinement of the LoRA-aligned students](#s6-2)
+  - [6.3 A smaller architecture: BGE-small](#s6-3)
+  - [6.4 Full fine-tune alignment and progressive pruning](#s6-4)
+  - [6.5 Strong students in the 100–150M range](#s6-5)
+  - [6.6 Contrastive refinement: number of negatives](#s6-6)
+  - [6.7 Summary](#s6-7)
+- [7. Student Architecture Experiments](#s7)
+- [8. Retrieval and Latency Evaluation](#s8)
+- [9. Future Directions](#s9)
+- [10. Conclusion](#s10)
+
+<a id="s1"></a>
+
 ## 1. Problem Statement
 
 Large embedding models provide strong retrieval performance but are expensive to deploy, particularly when query encoding needs to happen online with low latency.
@@ -21,6 +47,8 @@ I explore a three-phase training recipe:
 
 The overall goal is to reduce model size and inference latency while retaining compatibility with a fixed teacher document index.
 
+<a id="s2"></a>
+
 ## 2. Teacher Embedding Generation
 
 I use a Qwen 4B embedding model as the teacher. The teacher is kept frozen, and its embeddings are precomputed for queries and documents.
@@ -30,6 +58,8 @@ I did not fine-tune the teacher itself. It already provided a strong retrieval b
 All embeddings are generated with an output dimension of **256** and cached for subsequent experiments.
 
 **Notebook:** [Teacher Embedding Generation](https://www.kaggle.com/code/tensorpanda231/01-generate-teacher-embeddings)
+
+<a id="s3"></a>
 
 ## 3. Dataset and Experimental Setup
 
@@ -50,6 +80,8 @@ The retrieval corpus consists of **299,985 passages**: the positives and one sto
 
 An important detail is that distractor documents are part of the fixed teacher document index. The student does not receive these documents as alignment or training targets. They serve exclusively as competing candidates during retrieval.
 
+<a id="s3-compute"></a>
+
 ### Computational Setup
 
 All experiments were conducted using two NVIDIA T4 GPUs on Kaggle.
@@ -62,6 +94,8 @@ All experiments were conducted using two NVIDIA T4 GPUs on Kaggle.
 | Student query maximum length     | 32                                           |
 | Document maximum sequence length | 128                                          |
 | Retrieval corpus                 | 299,985 passages                             |
+
+<a id="s4"></a>
 
 ## 4. Teacher Baseline
 
@@ -94,7 +128,11 @@ Recall measures retrieval coverage, nDCG measures the quality of the overall ran
 
 These metrics together provide a more complete picture than using recall alone.
 
+<a id="s5"></a>
+
 ## 5. Three-Phase Training Recipe
+
+<a id="phase-1"></a>
 
 ### Phase 1: L2 Alignment
 
@@ -103,6 +141,8 @@ I use Qwen 0.6B as the initial student model.
 The objective is to train the student to reproduce the teacher's embeddings for the same queries. Only queries are aligned: the student is a query encoder, and documents are embedded once by the teacher and never encoded by the student. Teacher embeddings are already cached, so the teacher does not need to participate in the student training loop.
 
 This phase attempts to transfer the teacher's embedding space to a smaller model.
+
+<a id="phase-2"></a>
 
 ### Phase 2: Structured Pruning and Recovery
 
@@ -113,6 +153,8 @@ My initial pruning strategy removes evenly spaced Transformer layers. The remain
 I also conducted additional experiments with importance-based pruning to investigate whether selecting layers based on their importance produces better results than uniform depth reduction.
 
 **Notebook:** [Student Alignment and Pruning](https://www.kaggle.com/code/tensorpanda231/full-finetune-02-student-alignment-and-pruning)
+
+<a id="phase-3"></a>
 
 ### Phase 3: Contrastive Refinement
 
@@ -126,6 +168,8 @@ The motivation is to complement representation-level alignment with task-specifi
 
 **Notebook:** [Contrastive Refinement](https://www.kaggle.com/code/tensorpanda231/v3-03-contrastive-refinement), Version 3
 
+<a id="s6"></a>
+
 ## 6. Experiments
 
 The experiments are listed in the order they were run. Every result uses the same 299,985-passage teacher index and the same internal 5K validation and 5K test queries.
@@ -133,6 +177,8 @@ The experiments are listed in the order they were run. Every result uses the sam
 - **Retention** = student nDCG\@10 / teacher nDCG\@10 on the same split (teacher: 0.8015 on validation, 0.8063 on test).
 - **Latency** = query encoding only, in ms per query at batch size 1 and 32 (median of 3 repeats after a warm-up), on a Kaggle T4.
 - `_cr` = after contrastive refinement. `prog_l14` / `prog_l7` = the student pruned to 14 / 7 Transformer layers and recovered with L2 alignment.
+
+<a id="s6-1"></a>
 
 ### 6.1 LoRA alignment and progressive pruning
 
@@ -164,6 +210,8 @@ The 28-layer Qwen3-Embedding-0.6B student is aligned with LoRA (r=16) and a line
 
 The aligned student keeps 86.5% of the teacher's test nDCG\@10. Pruning to 14 layers drops this to 79.5%, and pruning to 7 layers drops it to 67.8%. The aligned model's 606M parameters include the LoRA adapter on top of the 596M base.
 
+<a id="s6-2"></a>
+
 ### 6.2 Contrastive refinement of the LoRA-aligned students
 
 **Notebook:** [03-contrastive-refinement](https://www.kaggle.com/code/tensorpanda231/03-contrastive-refinement), Version 4
@@ -184,6 +232,8 @@ Contrastive refinement is applied to each student from 6.1. Only the 28-layer st
 
 Contrastive refinement improves test nDCG\@10 by +0.0301 (aligned), +0.0271 (prog_l14) and +0.0576 (prog_l7). The smallest student gains the most.
 
+<a id="s6-3"></a>
+
 ### 6.3 A smaller architecture: BGE-small
 
 **Notebook:** [05-bge-small-align-and-refine](https://www.kaggle.com/code/tensorpanda231/05-bge-small-align-and-refine), Version 5
@@ -199,6 +249,8 @@ The same recipe, L2 alignment followed by contrastive refinement, applied to `BA
 | bge_aligned_cr | 0.9760      | 0.8850     | 0.7121   | 0.6601  | 0.8832    |
 
 Contrastive refinement improves test nDCG\@10 by +0.0216 (from 85.6% to 88.3% retention).
+
+<a id="s6-4"></a>
 
 ### 6.4 Full fine-tune alignment and progressive pruning
 
@@ -230,6 +282,8 @@ Same as 6.1, except every weight of the 28-layer student is trained during align
 
 The full fine-tune raises test nDCG\@10 over the LoRA run at every depth: +0.0625 at 28 layers (0.6975 → 0.7600), +0.0947 at 14 layers and +0.1576 at 7 layers. The 7-layer student has 55% fewer parameters than the 28-layer one, is 3.6× faster at batch size 1 (13.3 vs 48.5 ms/query), and keeps 87.4% of the teacher's test nDCG\@10.
 
+<a id="s6-5"></a>
+
 ### 6.5 Strong students in the 100–150M range
 
 **Notebook:** [06-strong-students-full-finetune](https://www.kaggle.com/code/tensorpanda231/06-strong-students-full-finetune), Version 2
@@ -257,6 +311,8 @@ Three independent embedding models, fully fine-tuned with L2 alignment: DenseOn 
 | e5_base    | 109M       | 8.069           | 123.9      | 0.375            | 2663.3      |
 
 With L2 alignment alone, Granite R2 (149M) reaches 0.7327 test nDCG\@10, above the pruned 7-layer Qwen student (266M, 0.7046). E5-base (109M) is the fastest model measured, at 8.1 ms/query at batch size 1, and keeps 89.4% of the teacher's test nDCG\@10.
+
+<a id="s6-6"></a>
 
 ### 6.6 Contrastive refinement: number of negatives
 
@@ -317,6 +373,8 @@ Contrastive refinement of the fully fine-tuned students from 6.4, with 1, 4 and 
 
 The gain from contrastive refinement grows as the student gets smaller, at every number of negatives. Going from 1 to 4 negatives adds +0.004 to +0.009 nDCG\@10. Going from 4 to 8 adds at most +0.0012. With 8 negatives, the 7-layer student reaches 0.7315 test nDCG\@10 (90.7% retention).
 
+<a id="s6-7"></a>
+
 ### 6.7 Summary
 
 Test split. The best contrastive-refinement run is used for each fully fine-tuned student (8 negatives, 6.6 Version 3).
@@ -340,6 +398,8 @@ Test split. The best contrastive-refinement run is used for each fully fine-tune
 
 Contrastive refinement changes only the weights, so a `_cr` model has the same parameter count and latency as its base model.
 
+<a id="s7"></a>
+
 ## 7. Student Architecture Experiments
 
 An important part of this investigation was understanding whether the proposed approach depends on a particular student architecture.
@@ -348,13 +408,15 @@ I conducted two additional sets of experiments:
 
 **Different embedding architectures:** I evaluated several independent embedding models in the 100–150M parameter range. The objective was to determine whether the alignment and refinement recipe generalizes beyond the Qwen architecture.
 
-[Notebook: Strong Student Models](https://www.kaggle.com/code/tensorpanda231/06-strong-students-full-finetune), Version 2. Results are in [6.5](#65-strong-students-in-the-100150m-range); the BGE-small run is in [6.3](#63-a-smaller-architecture-bge-small).
+[Notebook: Strong Student Models](https://www.kaggle.com/code/tensorpanda231/06-strong-students-full-finetune), Version 2. Results are in [6.5](#s6-5); the BGE-small run is in [6.3](#s6-3).
 
 **Different model capacities:** I also experimented with student models from the same model family, with progressively increasing parameter counts.
 
 These experiments help investigate the capacity limitations of L2 alignment. Smaller models may have limited ability to approximate the teacher's embedding representations, whereas larger students can potentially reproduce them more accurately.
 
 Contrastive refinement provides an additional retrieval-specific learning signal, helping the student distinguish positive and negative documents rather than focusing exclusively on matching teacher vectors.
+
+<a id="s8"></a>
 
 ## 8. Retrieval and Latency Evaluation
 
@@ -370,6 +432,8 @@ The main evaluation criteria are:
 - Model efficiency: Parameter count and inference latency.
 - Compression effectiveness: Retrieval performance retained after pruning and recovery.
 
+<a id="s9"></a>
+
 ## 9. Future Directions
 
 There are several directions worth exploring further:
@@ -384,6 +448,8 @@ An interesting related work is [LEAF: Knowledge Distillation of Text Embedding M
 LEAF demonstrates that directly aligning student representations with teacher embeddings using an L2 objective can be an effective knowledge distillation strategy. Its experiments also report that adding more elaborate internal representation losses did not improve its downstream retrieval results.
 
 This provides further motivation to investigate embedding alignment as a standalone foundation and study how pruning, recovery and contrastive refinement can complement it.
+
+<a id="s10"></a>
 
 ## 10. Conclusion
 
