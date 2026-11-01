@@ -1,0 +1,11 @@
+# GitHub Pages: serves README.md as the index and doc.md as doc.html.
+title: hlm-poc
+description: A small student query encoder (Qwen3-Embedding-0.6B) retrieving against a frozen teacher index (Qwen3-Embedding-4B)
+theme: jekyll-theme-cayman
+
+# GitHub's own renderer: kramdown breaks the <details> tables in README.md and most tables in doc.md
+markdown: GFM
+
+exclude:
+  - CLAUDE.md
+  - tests/
